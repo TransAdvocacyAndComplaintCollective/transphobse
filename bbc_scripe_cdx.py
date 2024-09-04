@@ -1,7 +1,7 @@
 import asyncio
 import aiohttp
 from bs4 import BeautifulSoup
-import json
+import csv
 from tqdm import tqdm  # For progress bar
 
 # Define headers to mimic a browser request
@@ -149,7 +149,7 @@ async def get_episodes(session, programme_id):
 
     return episodes
 
-# Step 4: Combine and Save Data
+# Step 4: Combine and Save Data to CSV
 async def scrape_bbc_programmes():
     all_programme_urls = await get_programme_urls()
     programme_data = []
@@ -168,11 +168,21 @@ async def scrape_bbc_programmes():
                 details['episodes'] = episodes
                 programme_data.append(details)
 
-    # Save data to a JSON file
-    with open('bbc_programmes.json', 'w') as f:
-        json.dump(programme_data, f, indent=4)
+    # Save data to a CSV file
+    with open('bbc_programmes.csv', 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        # Write headers
+        writer.writerow(['Programme ID', 'Title', 'Type', 'Episodes'])
 
-    print("Scraping completed and data saved to bbc_programmes.json")
+        # Write data
+        for data in programme_data:
+            pid = data['programme']['pid']
+            title = data['programme'].get('title', '')
+            type_ = data['programme'].get('type', '')
+            episodes = "; ".join(data.get('episodes', []))  # Joining episodes list as a string
+            writer.writerow([pid, title, type_, episodes])
+
+    print("Scraping completed and data saved to bbc_programmes.csv")
 
 # Execute the scraping function
 asyncio.run(scrape_bbc_programmes())
