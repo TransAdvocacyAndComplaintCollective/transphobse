@@ -1,231 +1,178 @@
-import csv
-import requests
-import time
-import logging
-import json
-import os
-import concurrent.futures
-from requests.exceptions import ConnectionError, HTTPError, Timeout, RequestException
+import asyncio
+import aiohttp
 from bs4 import BeautifulSoup
-import progressbar
+import json
+from tqdm import tqdm  # For progress bar
 
-from keywords import KEYWORDS
+# Define headers to mimic a browser request
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:129.0) Gecko/20100101 Firefox/129.0',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/png,image/svg+xml,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.5',
+    'Upgrade-Insecure-Requests': '1',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-User': '?1',
+    'Priority': 'u=0, i'
+}
 
-# Set up logging for debugging and monitoring
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Step 1: Scrape the Main A-Z Pages with Pagination
+async def fetch_programme_urls(session, char):
+    base_url = "https://www.bbc.co.uk/programmes/a-z/by/{}/all"
+    all_programme_urls = set()
+    page_num = 1
+    seen_urls = set()
+    consecutive_duplicate_pages = 0
 
-CHECKPOINT_FILE = 'checkpoint.json'
-
-def save_checkpoint(checkpoint_data):
-    """Save the checkpoint data to a file."""
-    try:
-        with open(CHECKPOINT_FILE, 'w') as f:
-            json.dump(checkpoint_data, f)
-    except IOError as e:
-        logging.error(f"Failed to save checkpoint: {e}")
-
-def load_checkpoint():
-    """Load the checkpoint data from a file."""
-    if os.path.exists(CHECKPOINT_FILE):
+    for _ in range(100):
+        url = f"{base_url.format(char)}?page={page_num}"
         try:
-            with open(CHECKPOINT_FILE, 'r') as f:
-                return json.load(f)
-        except (IOError, json.JSONDecodeError) as e:
-            logging.error(f"Failed to load checkpoint: {e}")
-            return create_default_checkpoint()
-    return create_default_checkpoint()
+            async with session.get(url) as response:
+                if response.status != 200:
+                    break
+                text = await response.text()
+                soup = BeautifulSoup(text, 'html.parser')
 
-def create_default_checkpoint():
-    """Create a default checkpoint structure."""
-    return {
-        'cdx_index': 0,
-        'offset': 0,
-        'processed_urls': [],
-        'cdx_processed': False
-    }
+                links = soup.find_all('a', href=True)
+                current_page_urls = set()
+                found_links = False
 
-def fetch_with_retry(url, max_retries, backoff_factor, params=None):
-    """Fetch data from a URL with retries and exponential backoff."""
-    try:
-        logging.info(f"Fetching URL: {url} with params: {params}")
-        response = requests.get(url, params=params, timeout=20)
-        response.raise_for_status()
-        data = [json.loads(line) for line in response.text.splitlines()]
-        return True, data
-    except (ConnectionError, HTTPError, Timeout) as e:
-        pass
-    except (json.JSONDecodeError, ValueError) as e:
-        logging.error(f"JSON decode error for {url}: {e}")
-        return False, []
-    except RequestException as e:
-        logging.error(f"An error occurred: {e}")
-        return False, []
-    
-    logging.error(f"Failed to fetch data from {url} after {max_retries} attempts.")
-    return False, []
+                for link in links:
+                    href = link['href']
+                    if (href.startswith('/programmes/') or href.startswith('https://www.bbc.co.uk/programmes/')) and "player" not in href:
+                        full_url = "https://www.bbc.co.uk" + href if href.startswith('/programmes/') else href
+                        if full_url.endswith('/all'):
+                            continue  # Skip any invalid or incorrect URLs like '/all'
+                        current_page_urls.add(full_url)
+                        if full_url not in all_programme_urls:
+                            all_programme_urls.add(full_url)
+                            found_links = True
 
-def get_total_items(base_url, url_pattern, max_retries, backoff_factor):
-    """Calculate the total number of items to fetch from the Common Crawl index."""
-    query_count_url = f"{base_url}?url={url_pattern}&output=json&showNumPages=true"
-    success, data = fetch_with_retry(query_count_url, max_retries, backoff_factor)
-    
-    if success and data:
+                if current_page_urls == seen_urls:
+                    consecutive_duplicate_pages += 1
+                    if consecutive_duplicate_pages >= 3:
+                        break
+                else:
+                    consecutive_duplicate_pages = 0
+
+                if not found_links:
+                    break
+
+                seen_urls = current_page_urls
+                page_num += 1
+        except Exception as e:
+            print(f"Error fetching {url}: {e}")
+            break
+
+    return list(all_programme_urls)
+
+async def get_programme_urls():
+    all_programme_urls = set()
+    characters = list("abcdefghijklmnopqrstuvwxyz@")
+
+    async with aiohttp.ClientSession(headers=HEADERS) as session:
+        tasks = [asyncio.create_task(fetch_programme_urls(session, char)) for char in characters]
+        
+        # Adding a progress bar for URL fetching
+        results = []
+        for task in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Fetching Programme URLs"):
+            result = await task
+            results.append(result)
+        
+        for result in results:
+            all_programme_urls.update(result)
+
+    return list(all_programme_urls)
+
+# Step 2: Fetch Program Details in JSON Format
+async def get_programme_details(session, programme_id, max_retries=3):
+    url = f"https://www.bbc.co.uk/programmes/{programme_id}.json"
+    retries = 0
+
+    while retries < max_retries:
         try:
-            if isinstance(data, list) and data and isinstance(data[0], dict):
-                page_size = data[0].get('pageSize', 0)
-                pages = data[0].get('pages', 0)
-                return page_size * pages
-        except (TypeError, AttributeError) as e:
-            logging.error(f"Error processing total items data: {e}")
-    return 0
+            async with session.get(url) as response:
+                if response.status == 404:
+                    print(f"404 Error: {url} not found.")
+                    return None  # Skip 404 errors
+                elif response.status >= 500:
+                    print(f"Server error {response.status} for {url}. Retrying...")
+                    retries += 1
+                    await asyncio.sleep(2)  # Wait a bit before retrying
+                    continue
 
+                response.raise_for_status()  # Raise an exception for other HTTP errors
+                return await response.json()
 
+        except aiohttp.ClientError as e:
+            print(f"Error fetching details for {programme_id}: {e}")
+            break
+        except Exception as e:
+            print(f"Unexpected error fetching details for {programme_id}: {e}")
+            break
 
-def fetch_wayback_bbc_news(url_pattern, max_retries=5, backoff_factor=2):
-    """
-    Fetch BBC news URLs from the Wayback Machine using a URL pattern.
+    print(f"Failed to fetch details for {programme_id} after {max_retries} retries.")
+    return None
 
-    Parameters:
-    - url_pattern (str): The URL pattern to search for in the Wayback Machine.
-    - max_retries (int): Maximum number of retries in case of errors.
-    - backoff_factor (int): Factor by which the backoff time increases after each retry.
+# Step 3: Scrape Episodes Guide Pages
+async def get_episodes(session, programme_id):
+    base_url = f"https://www.bbc.co.uk/programmes/{programme_id}/episodes/guide"
+    episodes = []
+    page_num = 1
+    stop = False
+    for _ in range(90):
+        try:
+            async with session.get(f"{base_url}?page={page_num}") as response:
+                if response.status != 200:
+                    break
+                text = await response.text()
+                soup = BeautifulSoup(text, 'html.parser')
+                episode_links = soup.find_all('a', href=True)
 
-    Returns:
-    - urls (list): A list of URLs fetched from the Wayback Machine.
-    """
-    from datetime import datetime
+                if not episode_links:
+                    break
 
-    urls = []
-    this_year = datetime.now().year
-    for year in range(1996, this_year):
-        wayback_page_count_url = f"http://web.archive.org/cdx/search/cdx?url={url_pattern}&filter=statuscode:200&collapse=urlkey&matchType=prefix&fl=original&from={year}&to={year}"
-        for attempt in range(max_retries):
-            try:
-                logging.info(f"Attempt {attempt + 1}: Fetching Wayback Machine data for pattern: {url_pattern}")
-                response = requests.get(wayback_page_count_url, timeout=20)
-                response.raise_for_status()
+                for link in episode_links:
+                    href = link['href']
+                    if href.startswith('/programmes/') and href.count('/') == 2:
+                        if href in episodes:
+                            stop = True
+                            break
+                        episodes.append("https://www.bbc.co.uk" + href)
+                if stop:
+                    break
+                page_num += 1
+        except Exception as e:
+            print(f"Error fetching episodes for {programme_id} on page {page_num}: {e}")
+            break
 
-                # Parse response and extract URLs
-                urls = response.text.splitlines()
-    
-                logging.info(f"Successfully fetched {len(urls)} URLs from Wayback Machine.")
-                return urls
-            
-            except (ConnectionError, HTTPError, Timeout) as e:
-                wait_time = backoff_factor * (2 ** attempt)  # Exponential backoff
-                logging.error(f"Error fetching Wayback Machine indexes: {e}. Retrying in {wait_time} seconds...")
-                time.sleep(wait_time)
-            except requests.RequestException as e:
-                logging.error(f"An error occurred while fetching Wayback Machine indexes: {e}")
-                break
-    
-    logging.error(f"Failed to fetch data from Wayback Machine after {max_retries} attempts.")
-    return urls
+    return episodes
 
-    
+# Step 4: Combine and Save Data
+async def scrape_bbc_programmes():
+    all_programme_urls = await get_programme_urls()
+    programme_data = []
 
+    async with aiohttp.ClientSession(headers=HEADERS) as session:
+        tasks = []
+        for programme_url in all_programme_urls:
+            programme_id = programme_url.split('/')[-1]
+            tasks.append(asyncio.create_task(get_programme_details(session, programme_id)))
 
-def fetch_commoncrawl_bbc_news(url_pattern, max_retries=5, backoff_factor=2):
-    """Fetch BBC news URLs from Common Crawl using a URL pattern."""
-    checkpoint_data = load_checkpoint()
-    urls = set(checkpoint_data['processed_urls'])
-    
-    try:
-        response = requests.get("https://index.commoncrawl.org/collinfo.json")
-        response.raise_for_status()
-        cc_cdxs = response.json()
-    except requests.RequestException as e:
-        logging.error(f"Error fetching Common Crawl indexes: {e}")
-        return []
+        # Adding a progress bar for fetching programme details
+        for future in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Fetching Programme Details"):
+            details = await future
+            if details:
+                episodes = await get_episodes(session, details['programme']['pid'])
+                details['episodes'] = episodes
+                programme_data.append(details)
 
-    all_entries = set()
+    # Save data to a JSON file
+    with open('bbc_programmes.json', 'w') as f:
+        json.dump(programme_data, f, indent=4)
 
-    with progressbar.ProgressBar(max_value=len(cc_cdxs), redirect_stdout=True, widgets=[
-        progressbar.Bar('=', '[', ']'), ' ', progressbar.Percentage(), ' ', progressbar.ETA()
-    ]) as outer_bar:
-        for index, cdx in enumerate(cc_cdxs):
-            if index < checkpoint_data['cdx_index']:
-                outer_bar.update(index + 1)
-                continue
-            
-            base_url = cdx['cdx-api']
-            total_items = get_total_items(base_url, url_pattern, max_retries, backoff_factor)
-            if total_items <= 0:
-                outer_bar.update(index + 1)
-                continue
+    print("Scraping completed and data saved to bbc_programmes.json")
 
-            offset = checkpoint_data['offset'] if index == checkpoint_data['cdx_index'] else 0
-
-            with progressbar.ProgressBar(max_value=total_items, redirect_stdout=True, widgets=[
-                progressbar.Bar('=', '[', ']'), ' ', progressbar.Percentage(), ' ', progressbar.ETA()
-            ]) as inner_bar:
-                while offset < total_items:
-                    query_url = f"{base_url}?url={url_pattern}&output=json&fields=url&collapse=digest&collapse=original&offset={offset}"
-                    success, new_entries = fetch_with_retry(query_url, max_retries, backoff_factor)
-                    if not success:
-                        break
-
-                    new_entries_set = set(entry["url"] for entry in new_entries) - urls
-                    if new_entries_set:
-                        all_entries.update(new_entries_set)
-                        urls.update(new_entries_set)
-                        for entry in new_entries_set:
-                            yield entry
-                        offset += len(new_entries)
-                        if offset > total_items:
-                            offset = total_items
-                        checkpoint_data.update({'cdx_index': index, 'offset': offset, 'processed_urls': list(urls)})
-                        save_checkpoint(checkpoint_data)
-                        inner_bar.update(offset)
-                    else:
-                        break
-
-                inner_bar.finish()
-            outer_bar.update(index + 1)
-
-            checkpoint_data.update({'cdx_index': index + 1, 'offset': 0})
-            save_checkpoint(checkpoint_data)
-
-def search_keywords_in_url(url, keywords):
-    """Fetch a webpage and search for specific keywords in its text content."""
-    try:
-        response = requests.get(url, timeout=5)
-        if response.status_code != 200:
-            return None
-        
-        soup = BeautifulSoup(response.text, "html.parser")
-        for script in soup(["script", "noscript"]):
-            script.extract()
-        page_text = soup.get_text().lower()
-        
-        for keyword in keywords:
-            if keyword.lower() in page_text:
-                return keyword
-        return None
-    except RequestException as e:
-        logging.error(f"Error fetching page {url}: {e}")
-        return None
-
-def main():
-    url_pattern = "bbc.co.uk/news/*"
-
-    with open('bbc_news_keywords.csv', mode='w', newline='', encoding='utf-8') as csv_file:
-        csv_writer = csv.writer(csv_file)
-        csv_writer.writerow(['URL', 'Keyword'])
-
-        for url in fetch_commoncrawl_bbc_news(url_pattern):
-            keyword_found = search_keywords_in_url(url, KEYWORDS)
-            if keyword_found:
-                csv_writer.writerow([url, keyword_found])
-            else:
-                logging.info(f"Keyword not found in: {url}")
-        
-        for url in fetch_wayback_bbc_news(url_pattern):
-            keyword_found = search_keywords_in_url(url, KEYWORDS)
-            if keyword_found:
-                csv_writer.writerow([url, keyword_found])
-            else:
-                logging.info(f"Keyword not found in: {url}")
-
-if __name__ == "__main__":
-    main()
+# Execute the scraping function
+asyncio.run(scrape_bbc_programmes())
