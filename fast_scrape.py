@@ -548,7 +548,7 @@ class KeyPhraseFocusCrawler:
         dc_date = bs.find("meta", attrs={"name": "DC.date"})
         if dc_date:
             metadata["datePublished"] = dc_date["content"]
-        if metadata["type"] is not None:
+        if metadata["type_page"] is not None:
             return metadata
 
         # Extract Microformats (hentry, hcard)
