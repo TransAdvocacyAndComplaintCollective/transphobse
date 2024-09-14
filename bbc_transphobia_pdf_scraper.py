@@ -8,7 +8,7 @@ from urllib.parse import urljoin, unquote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from PyPDF2 import PdfReader
 import camelot
-from keywords import Little_List
+from utils.keywords import Little_List
 import pandas as pd
 import fitz  # PyMuPDF
 

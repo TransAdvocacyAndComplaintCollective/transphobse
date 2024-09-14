@@ -1,11 +1,11 @@
 KEYWORDS = [
     "transphobia", "transphobic", "anti-trans", "trans hate", "trans exclusion", "trans rights violation",
-    "trans discrimination", "trans ", "trans-", "transgender", "trans people", "trans community",
+    "trans discrimination", "trans ", "trans-", "transgender", "trans people", "trans community","gender-"
     "trans issues", "trans rights", "non binary", "non-binary", "gender non-conforming", "gender identity", "trans advocacy",
     "trans-inclusive", "misgendering", "deadnaming", "gender-critical feminism", "trans-exclusionary radical feminist",
     "terf ", "trans exclusionary feminism", "gender critical", "adult human female", "trans identified males",
-    "misgendered", "gender-critical", "trans breast milk",
-    "gender ","trans man","trans woman", "trans.", "trans?", "trans,",
+    "misgendered", "gender-critical", "trans breast milk", "Hormone blockers", "puberty blockers"
+    "gender ","trans man","trans woman", "trans.", "trans?", "trans,","cass","wrong body"
 ]
 EXT_KEYWORDS = [
     "demimasc", "demigirl", "demiboy", "demifluid", "demiflux", "demigender", "demiguy", "demigal", "demienby",
@@ -3067,6 +3067,10 @@ PEAPLE_KEYWORDS = [
 ]
 OGS_KEYWORDS = [
     # 
+]
+ANTI_KEYWORDS = [
+    "transcended",
+    
 ]
 Little_List = KEYWORDS + EXT_KEYWORDS
 BIG_LIST = KEYWORDS + EXT_KEYWORDS + PEAPLE_KEYWORDS + OGS_KEYWORDS

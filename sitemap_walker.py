@@ -1,25 +1,44 @@
-import csv
+import os
+import gzip
+import pickle
+import threading
+import logging
+import time
 import requests
+import ssl
+import re
+import csv
+import concurrent.futures
+from bs4 import BeautifulSoup
+from io import BytesIO
+from urllib.parse import urljoin, urlparse, urlunparse
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import ssl
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
-import gzip
-from io import BytesIO
-from tqdm import tqdm
-import logging
-import random
-import time
+from cachetools import TTLCache, cached
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
 from typing import List, Tuple, Generator, Optional
+import networkx as nx
+from typing import List
 
 # Import custom keywords (assuming you have a module named `keywords.py`)
-from keywords import KEYWORDS
+from utils.keywords import  Little_List
 
 # Suppress InsecureRequestWarnings
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+# Checkpoint settings
+CHECKPOINT_DIR = 'checkpoints'  # Define a directory for checkpoints
+CHECKPOINT_FULL_FILE = os.path.join(CHECKPOINT_DIR, 'checkpoint_full.pkl.gz')  # Full checkpoint file path
+CHECKPOINT_INCREMENTAL_FILE = os.path.join(CHECKPOINT_DIR, 'checkpoint_incremental.pkl.gz')  # Incremental checkpoint file path
+
+# Create the checkpoint directory if it doesn't exist
+if not os.path.exists(CHECKPOINT_DIR):
+    os.makedirs(CHECKPOINT_DIR)
+
+# Lock for thread safety when writing to shared resources
+csv_lock = threading.Lock()
 
 class SSLAdapter(HTTPAdapter):
     """An HTTP adapter that uses a client SSL context."""
@@ -58,181 +77,228 @@ class SitemapCrawler:
         self.main_sitemap = main_sitemap
         self.target_paths = sorted(target_paths, key=len, reverse=True)
         self.anti_target_paths = sorted(anti_target_paths, key=len, reverse=True)
-        self.allowed_domains = [domain.lower() for domain in allowed_domains]
+        self.allowed_domains = set(domain.lower() for domain in allowed_domains)
         self.feeds = feeds or []
         self.page_like_sitemap = page_like_sitemap or []
         self.session = create_ssl_session(verify_ssl=False)  # Reusable session
-
-    def fetch_robots_txt(self, url: str) -> List[str]:
-        """Fetch and parse the robots.txt file to find sitemap URLs."""
-        robots_url = urljoin(url, "/robots.txt")
-        try:
-            with self.session.get(robots_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10, verify=False) as response:
-                response.raise_for_status()
-                return self.parse_robots_txt(response.text)
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Error fetching robots.txt from {robots_url}: {e}")
-            return []
-
-    @staticmethod
-    def parse_robots_txt(content: str) -> List[str]:
-        """Parse robots.txt content to extract sitemap URLs."""
-        return [line.split(":", 1)[1].strip() for line in content.splitlines() if line.lower().startswith("sitemap:")]
-
-    @staticmethod
-    def is_valid_url(url: str) -> bool:
-        """Check if the URL is valid and resolvable."""
-        parsed = urlparse(url)
-        return bool(parsed.scheme) and bool(parsed.netloc) and not (parsed.netloc.endswith('.local') or parsed.netloc.startswith('localhost'))
-
-    def path_matches(self, url: str, path_pattern: str) -> bool:
-        """Check if a URL path matches a specific pattern."""
-        return path_pattern.lower() in url.lower()
-
-    def matches_path(self, url: str, paths: List[str]) -> bool:
-        """Check if the URL matches any of the provided paths."""
-        return any(self.path_matches(url, path) for path in paths)
-
-    def get_sitemap_urls(self, url: str) -> Tuple[List[str], List[str]]:
-        """Retrieve URLs from a sitemap without filtering them out."""
-        if not self.is_valid_url(url):
-            return [], []
-
-        try:
-            with self.session.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10, verify=False) as response:
-                response.raise_for_status()
-                content_type = response.headers.get('Content-Type', '')
-
-                # Determine the content type and parse accordingly
-                if 'application/rss+xml' in content_type or 'application/atom+xml' in content_type or ".rss" in url:
-                    return self.parse_rss_feed(response.content)
-                elif 'application/xml' in content_type or 'text/xml' in content_type:
-                    if b'<rss' in response.content or b'<feed' in response.content:
-                        return self.parse_rss_feed(response.content)
-                    else:
-                        return self.parse_xml_sitemap(response.content)
-                elif 'text/plain' in content_type:
-                    return self.parse_text_sitemap(response.text)
-                elif 'text/html' in content_type:
-                    return self.parse_html_sitemap(response.text, url)
-                elif url.endswith('.gz'):
-                    return self.parse_gzip_sitemap(response.content)
-                else:
-                    logging.warning(f"Unknown content type for URL: {url} with content type: {content_type}")
-                    return [], []
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Error fetching sitemap from {url}: {e}")
-            return [], []
-
+        self.context_graph = nx.DiGraph()  # Initialize context graph
+        print("Crawler initialized.")
+        
+        
+    # Updated XML parser with 'features' parameter
     @staticmethod
     def parse_xml_sitemap(xml_content: bytes) -> Tuple[List[str], List[str]]:
         """Parse XML sitemap and return URLs and sitemaps."""
-        soup = BeautifulSoup(xml_content, 'xml')
+        soup = BeautifulSoup(xml_content, 'xml', features='xml')
         urls = [loc.text for loc in soup.find_all('loc')]
         sitemaps = [loc.text for loc in soup.find_all('sitemap loc')]
         return urls, sitemaps
 
     @staticmethod
-    def parse_text_sitemap(text_content: str) -> Tuple[List[str], List[str]]:
-        """Parse plain text sitemap and return URLs."""
-        urls = [line.strip() for line in text_content.splitlines() if line.strip()]
-        return urls, []
-
-    def parse_html_sitemap(self, html_content: str, base_url: str) -> Tuple[List[str], List[str]]:
+    def parse_html_sitemap(html_content: str, base_url: str) -> Tuple[List[str], List[str]]:
         """Parse HTML sitemap and return URLs."""
         soup = BeautifulSoup(html_content, 'html.parser')
-        urls = [urljoin(base_url, link['href']) for link in soup.find_all('a', href=True) if self.is_valid_url(urljoin(base_url, link['href']))]
+        urls = [urljoin(base_url, link['href']) for link in soup.find_all('a', href=True) if SitemapCrawler.is_valid_url(urljoin(base_url, link['href']))]
         return urls, []
 
-    @staticmethod
-    def parse_gzip_sitemap(gz_content: bytes) -> Tuple[List[str], List[str]]:
-        """Parse a .gz (Gzip) compressed sitemap and return URLs."""
+    def get_checkpoint_files(self) -> list:
+        """Retrieve a list of possible checkpoint files to attempt loading from, ordered by recency."""
+        checkpoint_files = []
+        # Add full checkpoint first
+        if os.path.exists(CHECKPOINT_FULL_FILE):
+            checkpoint_files.append(CHECKPOINT_FULL_FILE)
+
+        # Get the directory of the incremental checkpoint file
+        checkpoint_dir = os.path.dirname(CHECKPOINT_INCREMENTAL_FILE)
+
+        # Ensure checkpoint_dir is valid and exists
+        if checkpoint_dir and os.path.exists(checkpoint_dir):
+            incremental_files = sorted(
+                [os.path.join(checkpoint_dir, f) for f in os.listdir(checkpoint_dir) if f.startswith(os.path.basename(CHECKPOINT_INCREMENTAL_FILE))],
+                key=os.path.getmtime,
+                reverse=True
+            )
+            checkpoint_files.extend(incremental_files)
+        else:
+            logging.error(f"Checkpoint directory '{checkpoint_dir}' does not exist.")  # Corrected error message here
+
+        return checkpoint_files
+
+    def parse_robots_txt(content: str) -> List[str]:
+        """
+        Parse the content of a robots.txt file to extract sitemap URLs.
+    
+        Args:
+        - content (str): The content of the robots.txt file as a string.
+    
+        Returns:
+        - List[str]: A list of valid sitemap URLs found in the robots.txt content.
+        """
+        sitemaps = []
+    
+        # Split the content into lines and iterate through each line
+        for line in content.splitlines():
+            line = line.strip()  # Remove leading and trailing whitespace
+    
+            # Skip empty lines and comments
+            if not line or line.startswith('#'):
+                continue
+            
+            # Check if the line starts with 'Sitemap:' (case insensitive)
+            if line.lower().startswith("sitemap:"):
+                # Split the line on the first ':' to extract the URL
+                parts = line.split(":", 1)
+                if len(parts) == 2:
+                    sitemap_url = parts[1].strip()
+    
+                    # Validate the extracted URL
+                    if is_valid_url(sitemap_url):
+                        sitemaps.append(sitemap_url)
+    
+        return sitemaps
+    
+    def is_valid_url(url: str) -> bool:
+        """
+        Validate a URL to ensure it is well-formed.
+    
+        Args:
+        - url (str): The URL to validate.
+    
+        Returns:
+        - bool: True if the URL is valid, False otherwise.
+        """
+        parsed = urlparse(url)
+        return bool(parsed.scheme) and bool(parsed.netloc)
+
+    @cached(cache=TTLCache(maxsize=1000, ttl=86400))
+    def fetch_robots_txt(self, url: str) -> List[str]:
+        """
+        Fetch and parse the robots.txt file to find sitemap URLs.
+
+        Args:
+        - url (str): The base URL of the website (e.g., "https://www.example.com").
+
+        Returns:
+        - List[str]: A list of sitemap URLs extracted from the robots.txt file.
+        """
+        robots_url = urljoin(url, "/robots.txt")  # Construct the URL for robots.txt
         try:
-            with gzip.GzipFile(fileobj=BytesIO(gz_content)) as gz:
-                decompressed_content = gz.read()
-            return SitemapCrawler.parse_xml_sitemap(decompressed_content)
-        except Exception as e:
-            logging.error(f"Error parsing Gzip sitemap: {e}")
-            return [], []
+            # Make a GET request to fetch the robots.txt file
+            response = self.session.get(robots_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10, verify=False)
+            response.raise_for_status()  # Raise an exception for HTTP errors
 
-    @staticmethod
-    def parse_rss_feed(rss_content: bytes) -> Tuple[List[str], List[str]]:
-        """Parse RSS feed and return URLs."""
-        try:
-            soup = BeautifulSoup(rss_content, 'xml')
-            urls = [item.find('link').text for item in soup.find_all('item') if item.find('link')]
-            return urls, []
-        except Exception as e:
-            logging.error(f"Error parsing RSS feed: {e}")
-            return [], []
+            # Parse the content to extract sitemap URLs
+            sitemap_urls = self.parse_robots_txt(response.text)
+            return sitemap_urls
 
-    def filter_and_score_urls(self, urls: List[str]) -> List[str]:
-        """Filter URLs by target paths, exclude anti-target paths, and score them using a model."""
-        relevant_urls = [
-            url for url in urls
-            if not self.matches_path(url, self.anti_target_paths) and (self.matches_path(url, self.target_paths) or not self.target_paths)
-        ]
-        return relevant_urls
-
-    def is_allowed_domain(self, url: str) -> bool:
-        """Check if a URL belongs to any of the allowed domains or their subdomains."""
-        domain = urlparse(url).hostname.lower()
-        return any(domain == allowed_domain or domain.endswith(f".{allowed_domain}") for allowed_domain in self.allowed_domains)
-
+        except requests.exceptions.RequestException as e:
+            # Log an error message if there's an issue fetching robots.txt
+            logging.error(f"Error fetching robots.txt from {robots_url}: {e}")
+            return []
     def walk_sitemap_generator(self) -> Generator[Tuple[str, str], None, None]:
-        """Generator to walk through sitemap and sub-sitemaps recursively and yield URLs."""
+        """
+        Generator to walk through the main sitemap and its sub-sitemaps recursively, yielding URLs.
+
+        Yields:
+            Tuple[str, str]: A tuple containing the current sitemap URL and a discovered URL.
+        """
+        # Initialize the set of URLs to visit with the main sitemap and any additional feeds
         urls_to_visit = set(self.fetch_robots_txt(self.main_sitemap) or [urljoin(self.main_sitemap, "/sitemap.xml")])
         urls_to_visit.update(self.feeds)
 
         visited_sitemaps = set()
         visited_urls = set()
 
+        # Load checkpoint if available
+        urls_to_visit, visited_sitemaps, visited_urls = self.load_checkpoint(urls_to_visit, visited_sitemaps, visited_urls)
+
+        # Initialize progress bar for sitemap processing
         with tqdm(total=len(urls_to_visit), desc="Processing sitemaps", unit="sitemap") as pbar:
             while urls_to_visit:
                 current_url = urls_to_visit.pop()
+                current_url = self.normalize_url(current_url)
+
+                # Skip already visited sitemaps or URLs not in allowed domains
                 if current_url in visited_sitemaps or not self.is_allowed_domain(current_url):
                     continue
 
                 visited_sitemaps.add(current_url)
+                # Fetch URLs and sub-sitemaps from the current sitemap
                 urls, sitemaps = self.get_sitemap_urls(current_url)
+                self.update_context_graph(current_url, urls)
 
-                new_sitemaps = set(sitemaps) - visited_sitemaps
+                # Normalize and filter new sitemaps
+                new_sitemaps = set(self.normalize_url(url) for url in sitemaps) - visited_sitemaps
                 urls_to_visit.update(new_sitemaps)
 
+                # Filter and score URLs to prioritize more relevant links
                 filtered_urls = self.filter_and_score_urls(urls)
                 for url in filtered_urls:
+                    url = self.normalize_url(url)
+                    # Yield URLs that have not been visited and belong to allowed domains
                     if url not in visited_urls and self.is_allowed_domain(url):
                         visited_urls.add(url)
                         yield (current_url, url)
 
+                # If a URL matches the page-like sitemap pattern, add it to be visited
                 for url in urls:
-                    if self.matches_path(url, self.page_like_sitemap) and url not in visited_sitemaps:
-                        urls_to_visit.add(url)
+                    normalized_url = self.normalize_url(url)
+                    if self.matches_path(url, self.page_like_sitemap) and normalized_url not in visited_sitemaps:
+                        urls_to_visit.add(normalized_url)
 
+                # Update the progress bar and sleep briefly to avoid overwhelming the server
                 pbar.total = len(urls_to_visit) + len(visited_sitemaps)
-                time.sleep(1)  # Delay to avoid rate limiting; adjust or make conditional
+                time.sleep(0.1)
                 pbar.update(1)
 
+                # Periodically save incremental checkpoints
+                if len(visited_sitemaps) % self.dynamic_checkpoint_interval(len(visited_sitemaps), len(urls_to_visit) + len(visited_sitemaps)) == 0:
+                    self.async_save_checkpoint(urls_to_visit, visited_sitemaps, visited_urls, incremental=True)
+
+                # Save full checkpoint less frequently
+                if len(visited_sitemaps) % 500 == 0:
+                    self.async_save_checkpoint(urls_to_visit, visited_sitemaps, visited_urls, incremental=False)
+    
+@cached(cache=TTLCache(maxsize=1000, ttl=86400))
 def search_keywords_in_url(url: str, keywords: List[str]) -> Optional[str]:
-    """Fetch a webpage and search for specific keywords in its text content."""
+    """
+    Fetch a webpage and search for specific keywords in its text content.
+
+    Args:
+    - url (str): The URL of the webpage to fetch.
+    - keywords (List[str]): A list of keywords to search for in the webpage content.
+
+    Returns:
+    - Optional[str]: The first keyword found in the content, or None if no keyword is found.
+    """
     try:
-        with requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10) as response:
-            response.raise_for_status()
+        # Make a GET request to fetch the webpage content
+        with requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=30) as response:
+            response.raise_for_status()  # Ensure the request was successful
 
+            # Parse the webpage using BeautifulSoup
             soup = BeautifulSoup(response.text, "html.parser")
-            for script in soup(["script", "noscript"]):
+            
+            # Remove script, style, and other non-content tags
+            for script in soup(["script", "style", "noscript", "header", "footer", "aside"]):
                 script.extract()
-            page_text = soup.get_text().lower()
 
+            # Extract and lowercase the page's text content
+            page_text = soup.get_text(separator=' ', strip=True).lower()
+
+            # Search for keywords in the page text
             for keyword in keywords:
                 if keyword.lower() in page_text:
-                    return keyword
+                    return keyword  # Return the first matching keyword found
+        
+        # Return None if no keyword is found
         return None
     except requests.RequestException as e:
         logging.error(f"Error fetching page {url}: {e}")
         return None
 
 def main():
+    # Define the input configuration
     main_sitemap = "https://www.bbc.co.uk"
     target_paths = ["bbc.co.uk/news/", "bbc.co.uk/sport/"]
     anti_target_paths = ["bbc.co.uk/sport/topics/", "bbc.co.uk/news/topics/", "bbc.co.uk/news/business/topics/"]
@@ -249,23 +315,32 @@ def main():
     ]
     page_like_sitemap = ["bbc.co.uk/sport/", "bbc.co.uk/news/"]
 
+    # Initialize SitemapCrawler with provided arguments
     crawler = SitemapCrawler(main_sitemap, target_paths, anti_target_paths, allowed_domains, feeds, page_like_sitemap)
+
+    # Create the generator for URLs from the sitemap
     url_generator = crawler.walk_sitemap_generator()
 
-    with open('bbc_news_keywords_sitemap.csv', mode='w', newline='', encoding='utf-8') as csv_file:
+    # Open the CSV file to write results
+    with open('bbc_news_keywords_sitemap.csv', mode='a', newline='', encoding='utf-8') as csv_file:
         csv_writer = csv.writer(csv_file)
-        csv_writer.writerow(['URL', 'Keyword'])
+        if csv_file.tell() == 0:  # Check if file is empty to write the header
+            csv_writer.writerow(['URL', 'Keyword'])
 
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            future_to_url = {executor.submit(search_keywords_in_url, url, KEYWORDS): url for _, url in url_generator}
+        # Use ThreadPoolExecutor to concurrently search for keywords in URLs
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            # Submit tasks for all URLs to search for keywords
+            future_to_url = {executor.submit(search_keywords_in_url, url, Little_List): url for _, url in url_generator}
 
+            # Process each completed future
             for future in as_completed(future_to_url):
                 url = future_to_url[future]
                 try:
                     keyword_found = future.result()
                     if keyword_found:
-                        csv_writer.writerow([url, keyword_found])
-                        logging.info(f"Keyword found in {url}: {keyword_found}")
+                        with csv_lock:  # Ensure thread-safe access
+                            csv_writer.writerow([url, keyword_found])
+                            logging.info(f"Keyword found in {url}: {keyword_found}")
                 except Exception as e:
                     logging.error(f"Error processing URL {url}: {e}")
 
