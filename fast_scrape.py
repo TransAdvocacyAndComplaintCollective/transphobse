@@ -1,4 +1,6 @@
 import json
+import os
+import pickle
 import requests
 from urllib.parse import urljoin, urlparse
 from redis import Redis
@@ -38,7 +40,7 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
-
+CHECKPOINT_FILE = "crawler_checkpoint.pkl"
 
 class URLItem:
     def __init__(self, priority, url, url_type):
@@ -81,6 +83,37 @@ class KeyPhraseFocusCrawler:
         self.good = 0
         self.bad = 0
 
+    def save_checkpoint(self):
+        """Save the current state of the crawler to a file."""
+        state = {
+            "urls_to_visit": list(self.urls_to_visit.queue),
+            "seen_urls": self.seen_urls,
+            "graph": self.graph,
+            "keyphrase_correlates": self.keyphrase_correlates,
+            "keyphrase_non_correlates": self.keyphrase_non_correlates,
+            "good": self.good,
+            "bad": self.bad,
+        }
+        with open(CHECKPOINT_FILE, "wb") as f:
+            pickle.dump(state, f)
+        logger.info("Checkpoint saved.")
+
+    def load_checkpoint(self):
+        """Load the saved state of the crawler from a file."""
+        if os.path.exists(CHECKPOINT_FILE):
+            with open(CHECKPOINT_FILE, "rb") as f:
+                state = pickle.load(f)
+                self.urls_to_visit = PriorityQueue()
+                for item in state["urls_to_visit"]:
+                    self.urls_to_visit.put(item)
+                self.seen_urls = state["seen_urls"]
+                self.graph = state["graph"]
+                self.keyphrase_correlates = state["keyphrase_correlates"]
+                self.keyphrase_non_correlates = state["keyphrase_non_correlates"]
+                self.good = state["good"]
+                self.bad = state["bad"]
+            logger.info("Checkpoint loaded.")
+    
     def workout_new_keyphrases(self):
         output = {}
 
@@ -89,24 +122,26 @@ class KeyPhraseFocusCrawler:
         anti_keywords = getattr(self, "anti_keywords", [])
 
         try:
-            with open("new_keyphrases.csv", mode="w", newline="") as f:
+            # Open CSV in append mode ('a') to avoid overwriting
+            with open("new_keyphrases.csv", mode="a", newline="") as f:
                 csv_w = csv.writer(f)
-                csv_w.writerow(
-                    [
-                        "Keyphrase",
-                        "Score",
-                        "Keyphrase Correlates",
-                        "Found Keywords",
-                        "Found Keywords Anti",
-                    ]
-                )
+                # Check if the file is empty and write headers if so
+                if f.tell() == 0:
+                    csv_w.writerow(
+                        [
+                            "Keyphrase",
+                            "Score",
+                            "Keyphrase Correlates",
+                            "Found Keywords",
+                            "Found Keywords Anti",
+                        ]
+                    )
 
                 for keyphrase in self.keyphrase_correlates:
-                    found_keywords = [kw for kw in keywords if kw in  keyphrase] 
-                    found_keywords_anti = [
-                        akw for akw in anti_keywords if  akw in  keyphrase
-                    ]
+                    found_keywords = [kw for kw in keywords if kw in keyphrase]
+                    found_keywords_anti = [akw for akw in anti_keywords if akw in keyphrase]
 
+                    # Calculate score with proper checks to avoid KeyError
                     if keyphrase in self.keyphrase_non_correlates:
                         score = (self.keyphrase_correlates[keyphrase] / self.good) - (
                             self.keyphrase_non_correlates[keyphrase] / self.bad
@@ -114,6 +149,7 @@ class KeyPhraseFocusCrawler:
                     else:
                         score = self.keyphrase_correlates[keyphrase] / self.good
 
+                    # Store output for returning later
                     output[keyphrase] = score
 
                     # Write to CSV
@@ -123,14 +159,12 @@ class KeyPhraseFocusCrawler:
                             score,
                             True,  # Assuming this column is just a static True value as in your original code
                             json.dumps(found_keywords),  # Convert list to JSON string
-                            json.dumps(
-                                found_keywords_anti
-                            ),  # Convert list to JSON string
+                            json.dumps(found_keywords_anti),  # Convert list to JSON string
                         ]
                     )
 
         except Exception as e:
-            print(f"An error occurred while processing keyphrases: {e}")
+            logger.error(f"An error occurred while processing keyphrases: {e}")
 
         return output
 
@@ -306,7 +340,7 @@ class KeyPhraseFocusCrawler:
         """Initialize the output CSV file."""
         self.csv_file = open(self.output_csv, mode="a", newline="", buffering=1)
         self.csv_writer = csv.writer(self.csv_file)
-        self.csv_writer.writerow(["URL", "Score", "Keywords Found","type_page","description","headline","datePublished","dateModified","author"])
+        self.csv_writer.writerow(["URL", "Score", "Keywords Found","type_page","description","headline","datePublished","dateModified","author","new_keyphrases"])
 
     def _initialize_urls(self):
         """Initialize start URLs, scraping from specific domains if needed."""
@@ -463,116 +497,135 @@ class KeyPhraseFocusCrawler:
             "dateModified": None,
             "author": [],
         }
+        try:
 
-        # Extract JSON-LD, RDFa, Microdata
-        for script in bs.find_all("script"):
-            if script.get("type") == "application/ld+json":
-                json_data = json.loads(script.string)
-                # Extract type, description, headline, etc. from JSON-LD
-                metadata["type_page"] = json_data.get("@type", metadata["type_page"])
-                metadata["description"] = json_data.get(
-                    "description", metadata["description"]
-                )
-                metadata["headline"] = json_data.get("headline", metadata["headline"])
-                metadata["datePublished"] = json_data.get(
-                    "datePublished", metadata["datePublished"]
-                )
-                metadata["dateModified"] = json_data.get(
-                    "dateModified", metadata["dateModified"]
-                )
-                if "author" in json_data:
-                    if (
-                        "@type" in json_data["author"]
-                        and "Person" in json_data["author"]["@type"]
-                    ):
-                        author_info = {
-                            "name": json_data["author"].get("name"),
-                            "sameAs": json_data["author"].get("sameAs", None),
-                        }
-                        metadata["author"].append(author_info)
-        if metadata["type_page"] is not None:
-            return metadata
+            # Extract JSON-LD, RDFa, Microdata
+            for script in bs.find_all("script"):
+                if script.get("type") == "application/ld+json":
+                    json_data = json.loads(script.string)
+                    # Extract type, description, headline, etc. from JSON-LD
+                    metadata["type_page"] = json_data.get("@type", metadata["type_page"])
+                    metadata["description"] = json_data.get(
+                        "description", metadata["description"]
+                    )
+                    metadata["headline"] = json_data.get("headline", metadata["headline"])
+                    metadata["datePublished"] = json_data.get(
+                        "datePublished", metadata["datePublished"]
+                    )
+                    metadata["dateModified"] = json_data.get(
+                        "dateModified", metadata["dateModified"]
+                    )
+                    if "author" in json_data:
+                        author_data = json_data["author"]
+                        if isinstance(author_data, list):
+                             # Loop through list of authors
+                             for author in author_data:
+                                 if isinstance(author, dict):
+                                     metadata["author"].append({
+                                         "name": author.get("name"),
+                                         "sameAs": author.get("sameAs")
+                                     })
+                                 elif isinstance(author, str):
+                                     # Handle case where author is a simple string
+                                     metadata["author"].append({"name": author})
+                        
+                        elif isinstance(author_data, dict):
+                             # Single author case, and it's a dictionary
+                             metadata["author"].append({
+                                 "name": author_data.get("name"),
+                                 "sameAs": author_data.get("sameAs")
+                             })
+                        
+                        elif isinstance(author_data, str):
+                             # Single author case, and it's a string
+                             metadata["author"].append({"name": author_data})
+                            
+            if metadata["type_page"] is not None:
+                return metadata
 
-        # Extract OpenGraph metadata
-        og_type = bs.find("meta", property="og:type")
-        if og_type:
-            metadata["type_page"] = og_type["content"]
-        og_description = bs.find("meta", property="og:description")
-        if og_description:
-            metadata["description"] = og_description["content"]
-        og_title = bs.find("meta", property="og:title")
-        if og_title:
-            metadata["headline"] = og_title["content"]
-        og_date = bs.find("meta", property="article:published_time")
-        if og_date:
-            metadata["datePublished"] = og_date["content"]
-        if metadata["type_page"] is not None:
-            return metadata
+            # Extract OpenGraph metadata
+            og_type = bs.find("meta", property="og:type")
+            if og_type:
+                metadata["type_page"] = og_type["content"]
+            og_description = bs.find("meta", property="og:description")
+            if og_description:
+                metadata["description"] = og_description["content"]
+            og_title = bs.find("meta", property="og:title")
+            if og_title:
+                metadata["headline"] = og_title["content"]
+            og_date = bs.find("meta", property="article:published_time")
+            if og_date:
+                metadata["datePublished"] = og_date["content"]
+            if metadata["type_page"] is not None:
+                return metadata
 
-        # Extract Twitter Card metadata
-        twitter_card = bs.find("meta", attrs={"name": "twitter:card"})
-        if twitter_card:
-            metadata["type_page"] = twitter_card["content"]
-        twitter_title = bs.find("meta", attrs={"name": "twitter:title"})
-        if twitter_title:
-            metadata["headline"] = twitter_title["content"]
-        twitter_description = bs.find("meta", attrs={"name": "twitter:description"})
-        if twitter_description:
-            metadata["description"] = twitter_description["content"]
-        twitter_creator = bs.find("meta", attrs={"name": "twitter:creator"})
-        if twitter_creator:
-            metadata["author"].append({"name": twitter_creator["content"]})
-        if metadata["type_page"] is not None:
-            return metadata
+            # Extract Twitter Card metadata
+            twitter_card = bs.find("meta", attrs={"name": "twitter:card"})
+            if twitter_card:
+                metadata["type_page"] = twitter_card["content"]
+            twitter_title = bs.find("meta", attrs={"name": "twitter:title"})
+            if twitter_title:
+                metadata["headline"] = twitter_title["content"]
+            twitter_description = bs.find("meta", attrs={"name": "twitter:description"})
+            if twitter_description:
+                metadata["description"] = twitter_description["content"]
+            twitter_creator = bs.find("meta", attrs={"name": "twitter:creator"})
+            if twitter_creator:
+                metadata["author"].append({"name": twitter_creator["content"]})
+            if metadata["type_page"] is not None:
+                return metadata
 
-        # Extract standard meta tags
-        meta_description = bs.find("meta", attrs={"name": "description"})
-        if meta_description:
-            metadata["description"] = meta_description["content"]
-        meta_author = bs.find("meta", attrs={"name": "author"})
-        if meta_author:
-            metadata["author"].append({"name": meta_author["content"]})
-        meta_date = bs.find("meta", attrs={"name": "date"})
-        if meta_date:
-            metadata["datePublished"] = meta_date["content"]
-        if metadata["type_page"] is not None:
-            return metadata
+            # Extract standard meta tags
+            meta_description = bs.find("meta", attrs={"name": "description"})
+            if meta_description:
+                metadata["description"] = meta_description["content"]
+            meta_author = bs.find("meta", attrs={"name": "author"})
+            if meta_author:
+                metadata["author"].append({"name": meta_author["content"]})
+            meta_date = bs.find("meta", attrs={"name": "date"})
+            if meta_date:
+                metadata["datePublished"] = meta_date["content"]
+            if metadata["type_page"] is not None:
+                return metadata
 
-        # Extract Dublin Core metadata
-        dc_title = bs.find("meta", attrs={"name": "DC.title"})
-        if dc_title:
-            metadata["headline"] = dc_title["content"]
-        dc_creator = bs.find("meta", attrs={"name": "DC.creator"})
-        if dc_creator:
-            metadata["author"].append({"name": dc_creator["content"]})
-        dc_date = bs.find("meta", attrs={"name": "DC.date"})
-        if dc_date:
-            metadata["datePublished"] = dc_date["content"]
-        if metadata["type_page"] is not None:
-            return metadata
+            # Extract Dublin Core metadata
+            dc_title = bs.find("meta", attrs={"name": "DC.title"})
+            if dc_title:
+                metadata["headline"] = dc_title["content"]
+            dc_creator = bs.find("meta", attrs={"name": "DC.creator"})
+            if dc_creator:
+                metadata["author"].append({"name": dc_creator["content"]})
+            dc_date = bs.find("meta", attrs={"name": "DC.date"})
+            if dc_date:
+                metadata["datePublished"] = dc_date["content"]
+            if metadata["type_page"] is not None:
+                return metadata
 
-        # Extract Microformats (hentry, hcard)
-        hentry = bs.find(class_="hentry")
-        if hentry:
-            if not metadata["headline"]:
-                entry_title = hentry.find(class_="entry-title")
-                if entry_title:
-                    metadata["headline"] = entry_title.get_text()
-            if not metadata["datePublished"]:
-                entry_published = hentry.find(class_="published")
-                if entry_published:
-                    metadata["datePublished"] = entry_published["title"]
-            if not metadata["author"]:
-                entry_author = hentry.find(class_="author")
-                if entry_author:
-                    metadata["author"].append({"name": entry_author.get_text()})
-        if metadata["type_page"] is not None:
-            return metadata
-
+            # Extract Microformats (hentry, hcard)
+            hentry = bs.find(class_="hentry")
+            if hentry:
+                if not metadata["headline"]:
+                    entry_title = hentry.find(class_="entry-title")
+                    if entry_title:
+                        metadata["headline"] = entry_title.get_text()
+                if not metadata["datePublished"]:
+                    entry_published = hentry.find(class_="published")
+                    if entry_published:
+                        metadata["datePublished"] = entry_published["title"]
+                if not metadata["author"]:
+                    entry_author = hentry.find(class_="author")
+                    if entry_author:
+                        metadata["author"].append({"name": entry_author.get_text()})
+            if metadata["type_page"] is not None:
+                return metadata
+        except Exception as e:
+            logger.error(f"Error extracting metadata: {e}")
         return metadata
+    
     def _process_webpage(self, url):
         """Process standard webpage URLs."""
         score = 0
+        new_keyphrases = {}
         try:
             response = self.session.get(url)
             if response.status_code == 200:
@@ -606,13 +659,14 @@ class KeyPhraseFocusCrawler:
                 score, found_keywords = self.relative_score(text_content)
 
                 # Extract new key phrases from the page text
-                if "article" in metadata["type_page"].lower():
-                    new_keyphrases = self.extract_new_key_phrases(text_content)
-                    if score > 0:
-                        self.combine_with(new_keyphrases, True)
-                    else:
-                        self.combine_with(new_keyphrases, False)
-
+                if metadata["type_page"] is not None:
+                    if "article" in metadata["type_page"].lower():
+                        new_keyphrases = self.extract_new_key_phrases(text_content)
+                        if score > 0:
+                            self.combine_with(new_keyphrases, True)
+                        else:
+                            self.combine_with(new_keyphrases, False)
+    
                 # Log and update graph node with the result
                 if score > 0:
                     self.csv_writer.writerow(
@@ -626,6 +680,7 @@ class KeyPhraseFocusCrawler:
                             metadata["datePublished"],
                             metadata["dateModified"],
                             metadata["author"],
+                            json.dumps(new_keyphrases),
                         ]
                     )
                     self.update_graph_node(url, score, found_keywords)
@@ -641,18 +696,26 @@ class KeyPhraseFocusCrawler:
                     metadata["datePublished"],
                     metadata["dateModified"],
                     metadata["author"],
+                    new_keyphrases,  # Add new_keyphrases to the return statement
                 )
         except Exception as e:
             logger.error(f"Error processing webpage {url}: {e}")
-        return url, score, [], None, None, None, None, None, None
+        return url, score, [], None, None, None, None, None, None, new_keyphrases  # Add new_keyphrases to the return statement
+
+
+    
+    
+    
     def crawl(self):
         """Start the crawling process."""
         logger.info("Starting the crawling process.")
+        self.load_checkpoint()
         count = 0
         while not self.urls_to_visit.empty():
             count = count + 1
             if count % 100 == 0:
                 self.workout_new_keyphrases()
+                self.save_checkpoint()
             url_item = self.urls_to_visit.get()
             if url_item.url in self.seen_urls:
                 logger.debug(f"Skipping already seen URL: {url_item.url}")
@@ -678,9 +741,10 @@ class KeyPhraseFocusCrawler:
                     datePublished,
                     dateModified,
                     author,
+                    new_keyphrases
                 ) = self._process_webpage(url_item.url)
                 if score > 0:
-                    yield url, score, found_keywords, type_page, description, headline, datePublished, dateModified, author
+                    yield url, score, found_keywords, type_page, description, headline, datePublished, dateModified, author, new_keyphrases
 
         logger.info("Crawling process completed.")
 
@@ -723,9 +787,10 @@ class KeyPhraseFocusCrawler:
                         datePublished,
                         dateModified,
                         author,
+                        new_keyphrases
                     ) = self._process_webpage(current_page)
                     if score > 0:
-                        yield url, score, found_keywords, type_page, description, headline, datePublished, dateModified, author
+                        yield url, score, found_keywords, type_page, description, headline, datePublished, dateModified, author, new_keyphrases
 
                     for neighbor in self.graph.neighbors(current_page):
                         if neighbor not in visited:
@@ -756,6 +821,7 @@ class KeyPhraseFocusCrawler:
                                         datePublished,
                                         dateModified,
                                         author,
+                                        json.dumps(new_keyphrases)
                                     ]
                                 )
 
