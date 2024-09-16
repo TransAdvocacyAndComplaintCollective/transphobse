@@ -154,7 +154,11 @@ class KeyPhraseFocusCrawler:
         allowed_subdirs,
         output_csv="meage_crawler_results.csv",
         feeds=[],
+        irrelevant_for_keywords = [],
+        irrelevant_for_anti_keywords = [],
     ):
+        self.irrelevant_for_keywords = irrelevant_for_keywords
+        self.irrelevant_for_anti_keywords = irrelevant_for_anti_keywords
         self.start_urls = start_urls
         self.keywords = keywords
         self.anti_keywords = anti_keywords
@@ -168,8 +172,8 @@ class KeyPhraseFocusCrawler:
         self.stop_words = set(stopwords.words("english"))
         self.nlp = spacy.load("en_core_web_sm")
         self.pythonJsLock = Lock()
-        self.keyphrase_correlates = {}
-        self.keyphrase_non_correlates = {}
+        self.dict_lock = Lock()
+        self.keyphrases = {}
         self.good = 0
         self.bad = 0
         self.rob = {}
@@ -220,7 +224,6 @@ class KeyPhraseFocusCrawler:
             for site_url in site_urls:
                 score, found_keywords = self.relative_score(site_url[1])
                 if url in site_url[0]:
-                    print(site_url)
                     self._add_to_queue(site_url[0], "start", priority=score)
 
         # Start processing URLs concurrently using ThreadPoolExecutor
@@ -265,68 +268,239 @@ class KeyPhraseFocusCrawler:
             logger.info(
                 f"Added URL to queue: {url} with priority {priority} {url_type}"
             )
+    def combine_keywords(self, items, is_correlate, found_keywords, similarity_threshold=0.8, non_matching_similarity_threshold=0.5):
+        """
+        Combines keywords into a single dictionary, accumulating their scores and counts,
+        merges similar keywords based on cosine similarity using TF-IDF, and adds non-matching but similar texts.
+
+        Args:
+            items (dict): A dictionary of keyphrases with associated data.
+            is_correlate (bool): A flag indicating whether to mark the items as correlates or non-correlates.
+            found_keywords (list): List of keywords found in the text that match the keyphrases.
+            similarity_threshold (float): The threshold above which two keywords are considered similar.
+            non_matching_similarity_threshold (float): The threshold above which non-matching but similar texts are stored.
+        """
+        with self.dict_lock:
+            # Determine the label for correlates or non-correlates
+            phrase_type = 'correlate' if is_correlate else 'non-correlate'
+
+            # Prepare the corpus for TF-IDF vectorization
+            new_keywords = list(items.keys())
+            existing_keywords = list(self.keyphrases.keys())
+
+            # Skip processing if no new keywords
+            if not new_keywords:
+                return
+
+            # Combine all keywords for vectorization
+            corpus = new_keywords + existing_keywords
+            vectorizer = TfidfVectorizer().fit(corpus)
+
+            # Calculate TF-IDF vectors for new and existing keywords in a single operation
+            all_vectors = vectorizer.transform(corpus).toarray()
+            new_vectors = all_vectors[:len(new_keywords)]
+            existing_vectors = all_vectors[len(new_keywords):] if existing_keywords else None
+
+            # Update keywords dictionary with provided items
+            for i, (ke, item_data) in enumerate(items.items()):
+                text = item_data["text"]
+                score = item_data["score"]
+                tag = item_data["tag"]
+                keyword_type = item_data["type"]
+                count_terms = item_data["count"]
+
+                # Count the number of found keywords that match this keyphrase
+                found_keywords_count = sum(1 for kw in found_keywords if kw in text)
+
+                if text in self.keyphrases:
+                    # If the keyphrase already exists, update its data
+                    existing_entry = self.keyphrases[text]
+                    existing_entry["score"].append(score)  # Add score to list
+                    existing_entry["count"] += 1  # Increment total count
+                    existing_entry["count_terms"] += count_terms  # Increment count terms
+                    existing_entry["found_keywords_count"] += found_keywords_count  # Increment found keywords count
+
+                    # Increment correlate or non-correlate count
+                    if is_correlate:
+                        existing_entry["correlate_count"] += 1
+                    else:
+                        existing_entry["non_correlate_count"] += 1
+
+                    # Update tag if not already present
+                    if tag not in existing_entry["tag"]:
+                        existing_entry["tag"] += f", {tag}"
+
+                    # Update type only if not 'ner' (Named Entity Recognition) type
+                    if existing_entry["type"] != "ner":
+                        existing_entry["type"] = keyword_type
+                else:
+                    # Check for similar existing keywords to merge
+                    should_merge = False
+                    new_vector = new_vectors[i]
+
+                    # If there are existing keywords, compute cosine similarities in batch
+                    if existing_vectors is not None:
+                        similarities = cosine_similarity([new_vector], existing_vectors).flatten()
+
+                        # Find the most similar keyword above the threshold
+                        max_similarity_idx = np.argmax(similarities)
+                        max_similarity = similarities[max_similarity_idx]
+
+                        if max_similarity >= similarity_threshold:
+                            existing_text = existing_keywords[max_similarity_idx]
+                            existing_entry = self.keyphrases[existing_text]
+
+                            # Merge the new keyphrase with the existing one
+                            existing_entry["score"].append(score)  # Add score to list
+                            existing_entry["count"] += 1  # Increment total count
+                            existing_entry["count_terms"] += count_terms  # Increment count terms
+                            existing_entry["found_keywords_count"] += found_keywords_count  # Increment found keywords count
+
+                            # Increment correlate or non-correlate count
+                            if is_correlate:
+                                existing_entry["correlate_count"] += 1
+                            else:
+                                existing_entry["non_correlate_count"] += 1
+
+                            # Update tag if not already present
+                            if tag not in existing_entry["tag"]:
+                                existing_entry["tag"] += f", {tag}"
+
+                            # Update type only if not 'ner' (Named Entity Recognition) type
+                            if existing_entry["type"] != "ner":
+                                existing_entry["type"] = keyword_type
+
+                            should_merge = True
+
+                        elif non_matching_similarity_threshold <= max_similarity < similarity_threshold:
+                            # Add to non-matching but similar texts list
+                            existing_entry = self.keyphrases[existing_keywords[max_similarity_idx]]
+                            if "similar_texts" not in existing_entry:
+                                existing_entry["similar_texts"] = []
+                            existing_entry["similar_texts"].append({
+                                "text": text,
+                                "similarity": max_similarity
+                            })
+
+                    if not should_merge:
+                        # If no similar keyword found, create a new entry for the keyphrase
+                        self.keyphrases[text] = {
+                            "text": text,
+                            "score": [score],
+                            "tag": tag,
+                            "type": keyword_type,
+                            "count": 1,  # Initialize total count
+                            "count_terms": count_terms,
+                            "found_keywords_count": found_keywords_count,  # Initialize found keywords count
+                            "correlate_count": 1 if is_correlate else 0,  # Initialize correlate count
+                            "non_correlate_count": 0 if is_correlate else 1,  # Initialize non-correlate count
+                            "similar_texts": []  # Initialize empty list for similar texts
+                        }
+
+            # Debugging information
+            logger.info(f"Updated keyphrases: {self.keyphrases}")
 
     def workout_new_keyphrases(self):
         """
         Discover and write new key phrases to a CSV file by comparing correlated and non-correlated contexts.
         This method uses TF-IDF and cosine similarity to filter out redundant or less relevant phrases.
         """
+        # Prepare the keywords and anti-keywords sets for quick lookup
         keywords_set = set(self.keywords)
         anti_keywords_set = set(self.anti_keywords)
 
-        # Prepare data for TF-IDF
-        correlates_texts = [" ".join([kp for kp in self.keyphrase_correlates.keys()])]
-        non_correlates_texts = [" ".join([kp for kp in self.keyphrase_non_correlates.keys()])]
-        
-        # Combine texts for TF-IDF vectorization
+        # Separate correlated and non-correlated texts for processing
+        correlates_texts = [" ".join([key for key, data in self.keyphrases.items() if data['count']['correlate'] > 0])]
+        non_correlates_texts = [" ".join([key for key, data in self.keyphrases.items() if data['count']['non-correlate'] > 0])]
         combined_texts = correlates_texts + non_correlates_texts
-        
-        # Calculate TF-IDF vectors for keyphrases
+
+        # Ensure there is data to process
+        if not any(combined_texts):
+            logger.warning("No text data available for TF-IDF vectorization.")
+            return
+
+        # Debugging output to check combined texts
+        logger.info(f"Combined texts for TF-IDF: {combined_texts}")
+
+        # Calculate TF-IDF vectors for combined texts
         vectorizer = TfidfVectorizer().fit(combined_texts)
-        tfidf_matrix = vectorizer.transform(combined_texts)
-        
-        # Compute cosine similarity between correlated and non-correlated keyphrases
-        similarity_matrix = cosine_similarity(tfidf_matrix[0], tfidf_matrix[1])
-        
+
         # Open the CSV file for appending
         try:
             with open("new_keyphrases.csv", mode="w", newline="") as f:
                 csv_writer = csv.writer(f)
-                
+
                 # Write header if file is empty
                 if f.tell() == 0:
                     csv_writer.writerow([
                         "Keyphrase", "Good Count", "Bad Count", "Score Difference",
-                        "Tag", "Type", "Keywords Matched", "Anti-Keywords Matched", "Count Score"
+                        "Tag", "Type", "Keywords Matched", "Anti-Keywords Matched", "Count Score",
+                        "Average Score Correlate", "Average Score Non-Correlate", 
+                        "Std Dev Score Correlate", "Std Dev Score Non-Correlate",
+                        "Total Count Correlate", "Total Count Non-Correlate",
+                        "Most Similar Non-Correlate Phrase", "Similarity Score", "Related Keywords", "Similar Texts"
                     ])
-                
-                # Process each correlated keyphrase
-                for keyphrase, data in self.keyphrase_correlates.items():
-                    good_count = data["count_trems"] / data["count"]
-                    score_difference = good_count
-                    
-                    # Initialize bad_count
-                    bad_count = 0
-                    
-                    # Iterate through non-correlated keyphrases and compute weighted `bad_count`
-                    for non_keyphrase, non_data in self.keyphrase_non_correlates.items():
-                        # Calculate cosine similarity between the correlated and non-correlated keyphrase
-                        similarity = cosine_similarity(vectorizer.transform([keyphrase]), vectorizer.transform([non_keyphrase]))[0][0]
-                        
-                        if similarity > 0.8:  # Example threshold for similarity
-                            # Calculate weighted bad_count contribution
-                            bad_count += (non_data["count_trems"] / non_data["count"]) * similarity * score_difference
 
-                    # Calculate final score difference
+                # Process each correlated keyphrase
+                for keyphrase, data in self.keyphrases.items():
+                    if data['count']['correlate'] == 0:
+                        continue  # Skip non-correlate phrases
+                    
+                    # Calculate good count and initialize bad count
+                    good_count = data["count_terms"]["correlate"] / data["count"]["correlate"]
+                    bad_count = 0
+
+                    # Compute similarity metrics
+                    most_similar_non_correlate = None
+                    highest_similarity_score = 0
+
+                    # Compute bad count using similarity with non-correlated keyphrases
+                    for non_keyphrase, non_data in self.keyphrases.items():
+                        if non_data['count']['non-correlate'] == 0:
+                            continue  # Skip correlate phrases
+                        
+                        # Calculate cosine similarity between the correlated and non-correlated keyphrase
+                        similarity = cosine_similarity(
+                            vectorizer.transform([keyphrase]),
+                            vectorizer.transform([non_keyphrase])
+                        )[0][0]
+
+                        # Update the most similar non-correlate keyphrase
+                        if similarity > highest_similarity_score:
+                            highest_similarity_score = similarity
+                            most_similar_non_correlate = non_keyphrase
+
+                        # Weight the bad count by similarity
+                        if similarity > 0.6:  # Example threshold for similarity
+                            bad_count += (non_data["count_terms"]["non-correlate"] / non_data["count"]["non-correlate"]) * similarity * good_count
+
+                    # Calculate the score difference and count score
                     score_difference = good_count - bad_count
                     count_score = score_difference
+
+                    # Calculate average scores and standard deviations
+                    avg_score_correlate = (
+                        np.mean(data["score"]["correlate"]) if data["score"]["correlate"] else 0
+                    )
+                    avg_score_non_correlate = (
+                        np.mean(data["score"]["non-correlate"]) if data["score"]["non-correlate"] else 0
+                    )
+                    std_dev_score_correlate = (
+                        np.std(data["score"]["correlate"]) if data["score"]["correlate"] else 0
+                    )
+                    std_dev_score_non_correlate = (
+                        np.std(data["score"]["non-correlate"]) if data["score"]["non-correlate"] else 0
+                    )
+
+                    # Prepare related keywords for output
+                    related_keywords = ', '.join(data["related_keywords"]["correlate"])
 
                     # Filter out low score differences or highly similar phrases
                     if score_difference > 0.2:  # Example threshold, can be adjusted
                         # Determine keyword and anti-keyword matches
-                        keyword_match = [key for key in keywords_set if key in keyphrase]
-                        anti_keyword_match = [key for key in anti_keywords_set if key in keyphrase]
-                        
+                        keyword_match = [key for key in keywords_set if key.lower() in keyphrase.lower()]
+                        anti_keyword_match = [key for key in anti_keywords_set if key.lower() in keyphrase.lower()]
+
                         # Write new keyphrase data to the CSV
                         csv_writer.writerow([
                             keyphrase,
@@ -337,42 +511,23 @@ class KeyPhraseFocusCrawler:
                             data["type"],
                             ', '.join(keyword_match),
                             ', '.join(anti_keyword_match),
-                            count_score  # Added count_score to CSV
+                            count_score,  # Added count_score to CSV
+                            avg_score_correlate,
+                            avg_score_non_correlate,
+                            std_dev_score_correlate,
+                            std_dev_score_non_correlate,
+                            data['count']['correlate'],
+                            data['count']['non-correlate'],
+                            most_similar_non_correlate,
+                            highest_similarity_score,
+                            related_keywords,
+                            json.dumps(data.get("similar_texts", []))  # Convert similar texts to JSON string
                         ])
-        
+
         except Exception as e:
             logger.error(f"An error occurred while processing keyphrases: {e}")
 
-
-    def combine_keywords(self, items, correlates):
-        # Select the dictionary to update
-        keywords = (
-            self.keyphrase_correlates if correlates else self.keyphrase_non_correlates
-        )
-
-        # Update or add keywords with max score and accumulated counts
-        for ke in items:
-            text = items[ke]["text"]
-            score = items[ke]["score"]
-            if text in keywords:
-                keywords[text]["score"].append(items[ke]["score"])
-                keywords[text]["tag"] = items[ke]["tag"]
-                keywords[text]["type"] = items[ke]["type"]
-                keywords[text]["count"] = 1 + keywords[text]["count"]
-                keywords[text]["count_trems"] = items[ke]["count"] + keywords[text]["count_trems"] 
-            else:
-                keywords[text] = {
-                    "score": [score],
-                    "tag": items[ke]["tag"],
-                    "type": items[ke]["type"],
-                    "count": 1,
-                    "count_trems": items[ke]["count"] ,
-                }
-        # Update the appropriate dictionary in the class
-        if correlates:
-            self.keyphrase_correlates = keywords
-        else:
-            self.keyphrase_non_correlates = keywords
+    
 
     def extract_entities_with_types(self, text):
         """Extract named entities and their types using spaCy."""
@@ -444,7 +599,7 @@ class KeyPhraseFocusCrawler:
 
                 # Write results to CSV
                 if score > 0:
-                    self.combine_keywords(new_keyphrases, True)
+                    self.combine_keywords(new_keyphrases, is_correlate=True, found_keywords=found_keywords)
                     self.good += 1
                     if isinstance(new_keyphrases, np.ndarray):  # Check if it's a NumPy array
                         new_keyphrases = new_keyphrases.tolist()  # Convert to list
@@ -478,7 +633,7 @@ class KeyPhraseFocusCrawler:
                             ]
                         )
                 else:
-                    self.combine_keywords(new_keyphrases, True)
+                    self.combine_keywords(new_keyphrases, is_correlate=False, found_keywords=found_keywords)
                     self.bad += 1
 
                 return url, score, found_keywords, metadata, new_keyphrases
@@ -489,21 +644,70 @@ class KeyPhraseFocusCrawler:
             await asyncio.to_thread(process_url_content, text, url)
 
     def relative_score(self, text):
-        """Calculate the relevance score of a page or anchor text based on keywords and key phrases."""
-        score = sum(
-            len(re.findall(re.escape(keyword), text, re.IGNORECASE))
-            for keyword in self.keywords
-        )
-        anti_score = sum(
-            len(re.findall(re.escape(anti_keyword), text, re.IGNORECASE))
-            for anti_keyword in self.anti_keywords
-        )
-        found_keywords = [
-            keyword
-            for keyword in self.keywords
-            if re.search(re.escape(keyword), text, re.IGNORECASE)
-        ]
-        return score - anti_score, found_keywords
+        """
+        Calculate the relevance score of a page or anchor text based on keywords and key phrases,
+        handling both relevant and irrelevant keywords with context-aware logic and preventing substring conflicts.
+        """
+        # Initialize scoring variables
+        score = 0
+        anti_score = 0
+        relevant_window = 50  # Number of characters around a keyword to check for irrelevant content
+
+        # Prepare containers for processing keywords and positions
+        found_keywords = []
+        found_anti_keywords = []
+
+        # Function to determine if a segment of text contains any irrelevant phrases
+        def contains_irrelevant(phrases, segment):
+            return any(re.search(r'\b' + re.escape(phrase) + r'\b', segment, re.IGNORECASE) for phrase in phrases)
+
+        # Function to determine if a word should be counted as relevant
+        def is_relevant(word, irrelevant_phrases):
+            # Use word boundaries to match exact words and prevent substring matches
+            pattern = re.compile(r'\b' + re.escape(word) + r'\b', re.IGNORECASE)
+            # If the word is an exact match and not part of any irrelevant phrase, it's relevant
+            return pattern.search(text) and not contains_irrelevant(irrelevant_phrases, text)
+
+        # Extract relevant keywords and their positions, using word boundaries to avoid partial matches
+        for keyword in self.keywords:
+            for match in re.finditer(r'\b' + re.escape(keyword) + r'\b', text, re.IGNORECASE):
+                start, end = match.start(), match.end()
+                # Check for nearby irrelevant content within a defined window
+                if not contains_irrelevant(self.irrelevant_for_keywords, text[max(0, start - relevant_window): end + relevant_window]):
+                    found_keywords.append((keyword, start, end))
+
+        # Calculate relevant score based on unique keyword positions
+        processed_positions = set()
+        for keyword, start, end in found_keywords:
+            # Only count keywords that are not overlapping with already processed positions
+            if not any(pos in processed_positions for pos in range(start, end)):
+                # Assign weights dynamically based on keyword length or type
+                keyword_weight = len(keyword.split())  # Example: Longer phrases have more weight
+                score += keyword_weight
+                processed_positions.update(range(start, end))
+
+        # Extract anti-keywords and their positions
+        for anti_keyword in self.anti_keywords:
+            for match in re.finditer(r'\b' + re.escape(anti_keyword) + r'\b', text, re.IGNORECASE):
+                start, end = match.start(), match.end()
+                # Check for nearby relevant content within a defined window
+                if not contains_irrelevant(self.irrelevant_for_anti_keywords, text[max(0, start - relevant_window): end + relevant_window]):
+                    found_anti_keywords.append((anti_keyword, start, end))
+
+        # Calculate anti-relevant score based on unique anti-keyword positions
+        processed_anti_positions = set()
+        for anti_keyword, start, end in found_anti_keywords:
+            # Avoid counting anti-keywords that overlap with processed relevant keywords
+            if not any(pos in processed_positions for pos in range(start, end)):
+                # Assign weights dynamically to anti-keywords, possibly lower than for relevant keywords
+                anti_score += 1  # Simple weight for anti-keywords
+                processed_anti_positions.update(range(start, end))
+
+        # Calculate the final score and adjust based on the presence of both relevant and irrelevant keywords
+        final_score = score - anti_score
+
+        # Return the final score and a list of found relevant keywords for reporting
+        return final_score, list(set([kw for kw, _, _ in found_keywords]))
 
     def extract_metadata(self, bs):
         """Extract metadata from a BeautifulSoup object using OpenGraph, Twitter Cards, and other tags."""
@@ -767,7 +971,7 @@ class KeyPhraseFocusCrawler:
                 loop = asyncio.get_running_loop()
 
                 while not self.urls_to_visit.empty():
-                    for i in range(300):
+                    for i in range(100):
                         if self.urls_to_visit.empty():
                             break
 
@@ -844,6 +1048,7 @@ async def main():
         anti_keywords=anti_keywords,
         allowed_subdirs=allowed_subdirs,
         feeds=feeds,
+        irrelevant_for_keywords=kw.irrelevant_for_keywords
     )
     await crawler.crawl()
 
