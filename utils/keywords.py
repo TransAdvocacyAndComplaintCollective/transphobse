@@ -5,8 +5,7 @@ KEYWORDS = [
     "trans-inclusive", "misgendering", "deadnaming", "gender-critical feminism", "trans-exclusionary radical feminist",
     "terf ", "trans exclusionary feminism", "gender critical", "adult human female", "trans identified males",
     "misgendered", "gender-critical", "trans breast milk", "Hormone blockers", "puberty blockers"
-    "gender ","trans man","trans woman", "trans.", "trans?", "trans,","cass","wrong body"
-]
+    "gender ","trans man","trans woman", "trans.", "trans?", "trans,","Cass Review","hilary cass","cass report","wrong body"]
 EXT_KEYWORDS = [
     "demimasc", "demigirl", "demiboy", "demifluid", "demiflux", "demigender", "demiguy", "demigal", "demienby",
     "gender agnostic", "intersex woman", "intersex man", "intersex person", "intersex people", "intersex",
@@ -15,7 +14,7 @@ EXT_KEYWORDS = [
         "x-gender","cogenitor","altersex","assigned female at birth","neutral sex","assigned at birth","transmasculine","genderfluid",
         "travesti","hermaphroditism","cisgender man","cisgender woman","genderqueer","takatāpui","androgynos", "'akava'ine",
         "māhū","muxe","faʻafafine","shapeshifter","futanari","fakaleitī","agender","hijra","kathoey","two spirit","androgyny"
-        ,"queer","third gender","third-gender","non-binary","trannies","tranny"
+        ,"queer","third gender","third-gender","non-binary","trannies","tranny", "women-only", "women only", "LGB "
 ]
 PEAPLE_KEYWORDS = [
     # pseudonym

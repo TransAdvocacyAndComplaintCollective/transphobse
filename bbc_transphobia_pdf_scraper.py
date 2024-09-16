@@ -163,7 +163,6 @@ def match_urls_to_table_cells(table, datas):
     for data in valid_datas:
         matched = False
         data_text_lower = data['text'].lower()
-        print(data_text_lower)
         for i in clean_and_split(str(data_text_lower)):
             print("clean_strings->",i)
 
@@ -179,7 +178,6 @@ def match_urls_to_table_cells(table, datas):
 
         if not matched:
             for row_index, all_row_text in enumerate(all_row_texts):
-                print(all_row_text)
                 if matched_rows[row_index]:
                     continue
                 if data_text_lower in all_row_text or all_row_text in data_text_lower:
