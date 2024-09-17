@@ -35,7 +35,7 @@ KEYWORDS = [
     "trans breast milk",
     "Hormone blockers",
     "puberty blockers",
-    "Tranvestia",
+    "tranvestia",
     "transmedicalism",
     "gender ",
     "trans man",
@@ -115,7 +115,22 @@ EXT_KEYWORDS = [
     "tranny",
     "women-only",
     "women only",
-    "LGB"
+    "lgb",
+    "sex matters",
+    "single sex spaces",
+    "gender identity",
+    "misgendering",
+    "intersectionality",
+    "conversion therapy",
+    "biological essentialism",
+    "identity denial",
+    "gender dysphoria",
+    "gender euphoria",
+    "protect women's rights",
+    "protect women rights",
+    "protect womens rights",
+    "sex change",
+    "sex-change"
 ]
 
 OGS_KEYWORDS = []
