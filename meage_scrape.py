@@ -31,6 +31,7 @@ import yake
 from keybert import KeyBERT
 import concurrent.futures
 from reddit import reddit_domain_scrape
+from utils.BackedURLQueue import SQLitePriorityQueue
 
 # Download required NLTK resources
 nltk.download("punkt")
@@ -132,6 +133,9 @@ class UpdatablePriorityQueue:
     def __len__(self):
         """Return the number of items in the queue."""
         return len(self.entry_finder)
+    def have_been_seen(self, url):
+        """Check if the URL has been seen before."""
+        return url in self.seen_urls
 
 
 class URLItem:
@@ -161,6 +165,9 @@ class KeyPhraseFocusCrawler:
         irrelevant_for_keywords = [],
         irrelevant_for_anti_keywords = [],
     ):
+        Checkpointing()
+        CrawlerDatabase()
+        SQLitePriorityQueue()
         self.processed_urls_count = 0  # Initialize the processed URLs counter
         self.checkpoint_file ="crawler_checkpoint_meage.pkl"
         self.checkpoint_interval =600
@@ -170,6 +177,7 @@ class KeyPhraseFocusCrawler:
         self.keywords = keywords
         self.anti_keywords = anti_keywords
         self.allowed_subdirs = allowed_subdirs
+        self.lockfs = Lock()
         self.output_csv = output_csv
         self.feeds = feeds
         self.urls_to_visit = UpdatablePriorityQueue()
@@ -231,21 +239,22 @@ class KeyPhraseFocusCrawler:
         """Initialize the output CSV file."""
         self.csv_file = open(self.output_csv, mode="a", newline="", buffering=1)
         self.csv_writer = csv.writer(self.csv_file)
-        if self.csv_file.tell() == 0:
-            self.csv_writer.writerow(
-                [
-                    "URL",
-                    "Score",
-                    "Keywords Found",
-                    "type_page",
-                    "description",
-                    "headline",
-                    "datePublished",
-                    "dateModified",
-                    "author",
-                    "new_keyphrases",
-                ]
-            )
+        with self.lockfs:
+            if self.csv_file.tell() == 0:
+                self.csv_writer.writerow(
+                    [
+                        "URL",
+                        "Score",
+                        "Keywords Found",
+                        "type_page",
+                        "description",
+                        "headline",
+                        "datePublished",
+                        "dateModified",
+                        "author",
+                        "new_keyphrases",
+                    ]
+                )
 
     def _initialize_urls(self):
         """Initialize start URLs and add them to the queue."""
@@ -304,17 +313,14 @@ class KeyPhraseFocusCrawler:
             logger.error(f"Error fetching robots.txt for {url}: {e}")
         return None
 
-    def _add_to_queue(self, url, url_type, from_page=None, priority=0):
+    def _add_to_queue(self, url, url_type, priority=0):
         """Add a URL to the queue if it hasn't been visited, with a given priority."""
         normalized_url = self._normalize_url(url)
-        if normalized_url in self.seen_urls:
-            logger.debug(f"Skipping already seen URL: {normalized_url}")
-            return
+        # if normalized_url in self.seen_urls:
+        #     logger.debug(f"Skipping already seen URL: {normalized_url}")
+        #     return
         logger.debug(f"Adding URL to queue: {normalized_url} with priority {priority}")
         self.urls_to_visit.add_or_update(URLItem(priority, normalized_url, url_type), priority)
-        # self.graph.add_node(url, score=priority)
-        # if from_page:
-        #     self.graph.add_edge(from_page, normalized_url, score=priority, url_type=url_type)
         if priority > 0:
             logger.info(f"Added URL to queue: {url} with priority {priority} {url_type}")
     
@@ -752,11 +758,14 @@ class KeyPhraseFocusCrawler:
                     logger.info(f"URL {url} processed with positive score {score}. Writing to CSV.")
                     if isinstance(new_keyphrases, np.ndarray):  # Check if it's a NumPy array
                         new_keyphrases = new_keyphrases.tolist()  # Convert to list
-                    self.csv_writer.writerow([
-                        url, score, found_keywords, metadata["type_page"], metadata["description"],
-                        metadata["headline"], metadata["datePublished"], metadata["dateModified"], metadata["author"],
-                        json.dumps(new_keyphrases)
-                    ])
+                        with self.lockfs:
+                            self.csv_writer.writerow([
+                                url, score, found_keywords, metadata["type_page"], metadata["description"],
+                                metadata["headline"], metadata["datePublished"], metadata["dateModified"], metadata["author"],
+                                json.dumps(new_keyphrases)
+                            ])
+                    else:
+                        print("on no")
                 else:
                     # self.combine_keywords(new_keyphrases, is_correlate=False, found_keywords=found_keywords, found_anit_keywords=found_anit_keywords)
                     self.bad += 1
@@ -838,7 +847,7 @@ class KeyPhraseFocusCrawler:
         return final_score, list(set([kw for kw, _, _ in found_keywords])), list(set([kw for kw, _, _ in found_anti_keywords]))
 
     def extract_metadata(self, bs):
-        """Extract metadata from a BeautifulSoup object using OpenGraph, Twitter Cards, and other tags."""
+        """Extract metadata from a BeautifulSoup object using OpenGraph, Twitter Cards, JSON-LD, Dublin Core, and other tags."""
         metadata = {
             "type_page": None,
             "description": None,
@@ -846,7 +855,10 @@ class KeyPhraseFocusCrawler:
             "datePublished": None,
             "dateModified": None,
             "author": [],
+            "keywords": [],
+            "robots": None,
         }
+        
         try:
             # OpenGraph metadata
             og_type = bs.find("meta", property="og:type")
@@ -861,7 +873,7 @@ class KeyPhraseFocusCrawler:
             og_date = bs.find("meta", property="article:published_time")
             if og_date:
                 metadata["datePublished"] = og_date["content"]
-
+    
             # Twitter Card metadata
             twitter_title = bs.find("meta", attrs={"name": "twitter:title"})
             if twitter_title:
@@ -872,10 +884,90 @@ class KeyPhraseFocusCrawler:
             twitter_creator = bs.find("meta", attrs={"name": "twitter:creator"})
             if twitter_creator:
                 metadata["author"].append({"name": twitter_creator["content"]})
-
+    
+            # JSON-LD metadata: Find all JSON-LD scripts
+            json_ld_scripts = bs.find_all("script", type="application/ld+json")
+            for json_ld_script in json_ld_scripts:
+                try:
+                    json_ld_data = json.loads(json_ld_script.string)
+                    # Handle cases where the JSON-LD is a list of objects
+                    if isinstance(json_ld_data, list):
+                        for item in json_ld_data:
+                            self._merge_json_ld_metadata(metadata, item)
+                    else:
+                        self._merge_json_ld_metadata(metadata, json_ld_data)
+    
+                except json.JSONDecodeError as e:
+                    logger.error(f"Error parsing JSON-LD metadata: {e}")
+    
+            # Standard HTML Meta Tags
+            meta_description = bs.find("meta", attrs={"name": "description"})
+            if meta_description:
+                metadata["description"] = meta_description["content"]
+            meta_author = bs.find("meta", attrs={"name": "author"})
+            if meta_author:
+                metadata["author"].append({"name": meta_author["content"]})
+            meta_keywords = bs.find("meta", attrs={"name": "keywords"})
+            if meta_keywords:
+                metadata["keywords"] = meta_keywords["content"].split(",")
+            meta_robots = bs.find("meta", attrs={"name": "robots"})
+            if meta_robots:
+                metadata["robots"] = meta_robots["content"]
+    
+            # Dublin Core Metadata
+            dc_title = bs.find("meta", attrs={"name": "DC.title"})
+            if dc_title:
+                metadata["headline"] = dc_title["content"]
+            dc_creator = bs.find("meta", attrs={"name": "DC.creator"})
+            if dc_creator:
+                metadata["author"].append({"name": dc_creator["content"]})
+            dc_description = bs.find("meta", attrs={"name": "DC.description"})
+            if dc_description:
+                metadata["description"] = dc_description["content"]
+    
+            # Schema.org Microdata (if present)
+            microdata_title = bs.find(attrs={"itemprop": "name"})
+            if microdata_title:
+                metadata["headline"] = microdata_title.get_text()
+            microdata_description = bs.find(attrs={"itemprop": "description"})
+            if microdata_description:
+                metadata["description"] = microdata_description.get_text()
+            microdata_author = bs.find(attrs={"itemprop": "author"})
+            if microdata_author:
+                metadata["author"].append({"name": microdata_author.get_text()})
+    
+            # RSS/Atom Feeds
+            rss_feed = bs.find("link", attrs={"type": "application/rss+xml"})
+            if rss_feed:
+                metadata["rss_feed"] = rss_feed["href"]
+            atom_feed = bs.find("link", attrs={"type": "application/atom+xml"})
+            if atom_feed:
+                metadata["atom_feed"] = atom_feed["href"]
+            
         except Exception as e:
             logger.error(f"Error extracting metadata: {e}")
+        
         return metadata
+    
+    
+    def _merge_json_ld_metadata(self, metadata, json_ld_data):
+        """Helper function to merge JSON-LD data into the existing metadata dictionary."""
+        if "@type" in json_ld_data and not metadata["type_page"]:
+            metadata["type_page"] = json_ld_data["@type"]
+        if "headline" in json_ld_data and not metadata["headline"]:
+            metadata["headline"] = json_ld_data["headline"]
+        if "description" in json_ld_data and not metadata["description"]:
+            metadata["description"] = json_ld_data.get("description")
+        if "datePublished" in json_ld_data and not metadata["datePublished"]:
+            metadata["datePublished"] = json_ld_data["datePublished"]
+        if "dateModified" in json_ld_data and not metadata["dateModified"]:
+            metadata["dateModified"] = json_ld_data.get("dateModified")
+        if "author" in json_ld_data:
+            if isinstance(json_ld_data["author"], dict):
+                metadata["author"].append({"name": json_ld_data["author"].get("name")})
+            elif isinstance(json_ld_data["author"], list):
+                for author in json_ld_data["author"]:
+                    metadata["author"].append({"name": author.get("name")})
 
     def clean_text(self, text):
         """Clean input text by removing extra newlines, spaces, URLs, and unwanted characters."""
@@ -926,23 +1018,26 @@ class KeyPhraseFocusCrawler:
         return True
 
     def filter_similar_keywords(self, keywords, threshold=0.8):
-        """Filter out semantically similar keywords to keep only the most relevant."""
-        # Calculate TF-IDF vector for all keywords
-        vectorizer = TfidfVectorizer().fit_transform([kw["text"] for kw in keywords])
-        vectors = vectorizer.toarray()
-        # Compute cosine similarity matrix
-        cosine_matrix = cosine_similarity(vectors)
-        # Initialize a set to keep unique keywords
-        unique_keywords = []
-        for i, kw in enumerate(keywords):
-            # Check if this keyword is not too similar to any selected unique keyword
-            if all(
-                cosine_matrix[i][j] < threshold
-                for j in range(i)
-                if keywords[j] in unique_keywords
-            ):
-                unique_keywords.append(kw)
-        return unique_keywords
+        try:
+            """Filter out semantically similar keywords to keep only the most relevant."""
+            # Calculate TF-IDF vector for all keywords
+            vectorizer = TfidfVectorizer().fit_transform([kw["text"] for kw in keywords])
+            vectors = vectorizer.toarray()
+            # Compute cosine similarity matrix
+            cosine_matrix = cosine_similarity(vectors)
+            # Initialize a set to keep unique keywords
+            unique_keywords = []
+            for i, kw in enumerate(keywords):
+                # Check if this keyword is not too similar to any selected unique keyword
+                if all(
+                    cosine_matrix[i][j] < threshold
+                    for j in range(i)
+                    if keywords[j] in unique_keywords
+                ):
+                    unique_keywords.append(kw)
+            return unique_keywords
+        except:
+            return []
 
     def extract_key_phrases(
         self,
@@ -1114,59 +1209,50 @@ class KeyPhraseFocusCrawler:
     
     async def crawl(self):
         """Start the crawling process."""
+        print("Start the crawling process")
         batch_size = 50
         self.semaphore = asyncio.Semaphore(1)
         tasks = []  # List to hold all asynchronous tasks
-        with tqdm(total=len(self.urls_to_visit), desc="Crawling Progress") as pbar:
-            async with aiohttp.ClientSession() as session:
-                while not self.urls_to_visit.empty():
-                    logger.info(f"Processing batch of up to {batch_size} URLs")
-                    for i in range(batch_size):
-                        if self.urls_to_visit.empty():
-                            break
-
-                        # Get the next URL to process
-                        url_item = self.urls_to_visit.pop()
-                        logger.debug(f"Processing URLItem: {url_item}")
-
-                        # Check robots.txt rules
-                        o = urlparse(url_item.url)
-                        if o.hostname in self.rob and not self.rob[o.hostname].can_fetch("*", url_item.url):
-                            logger.warning(f"Blocked by robots.txt: {url_item.url}")
-                            continue
-
-                        # Skip if URL is already seen
-                        if url_item.url in self.seen_urls:
-                            logger.debug(f"Already seen URL: {url_item.url}")
-                            continue
-
-                        self.seen_urls.add(url_item.url)
-
-                        # Depending on URL type, choose processing function
-                        if url_item.url_type == "feed":
-                            task = self._process_feed(session, url_item.url)
-                        elif url_item.url_type == "sitemap":
-                            task = self._process_sitemap(session, url_item.url)
-                        else:
-                            task = self._process_url(session, url_item.url)
-                        tasks.append(task)  # Add the task to the list
-
-                    # Wait for tasks to complete in batches
-                    logger.info(f"Executing batch of {len(tasks)} tasks")
-                    await asyncio.gather(*tasks)
-                    pbar.total = len(self.urls_to_visit) + self.good + self.bad + batch_size
-                    pbar.update(batch_size)
-                    tasks.clear()  # Clear tasks for the next batch
-                    # self.workout_new_keyphrases()
-                    
-                    self.processed_urls_count += batch_size
-                    # Save checkpoint periodically
-                    if self.processed_urls_count >= self.checkpoint_interval:
-                        self._save_checkpoint()
-                        self.processed_urls_count = 0  # Reset the counter after saving
-
-                # After all URLs are processed
-            # self.workout_new_keyphrases()
+        async with aiohttp.ClientSession() as session:
+            while not self.urls_to_visit.empty():
+                logger.info(f"Processing batch of up to {batch_size} URLs")
+                for i in range(batch_size):
+                    if self.urls_to_visit.empty():
+                        break
+                    # Get the next URL to process
+                    url_item = self.urls_to_visit.pop()
+                    print(url_item)
+                    logger.debug(f"Processing URLItem: {url_item}")
+                    # Check robots.txt rules
+                    o = urlparse(url_item.url)
+                    if o.hostname in self.rob and not self.rob[o.hostname].can_fetch("*", url_item.url):
+                        logger.warning(f"Blocked by robots.txt: {url_item.url}")
+                        continue
+                    # Skip if URL is already seen
+                    if url_item.url in self.seen_urls:
+                        logger.debug(f"Already seen URL: {url_item.url}")
+                        continue
+                    self.seen_urls.add(url_item.url)
+                    # Depending on URL type, choose processing function
+                    if url_item.url_type == "feed":
+                        task = self._process_feed(session, url_item.url)
+                    elif url_item.url_type == "sitemap":
+                        task = self._process_sitemap(session, url_item.url)
+                    else:
+                        task = self._process_url(session, url_item.url)
+                    tasks.append(task)  # Add the task to the list
+                # Wait for tasks to complete in batches
+                logger.info(f"Executing batch of {len(tasks)} tasks")
+                await asyncio.gather(*tasks)
+                tasks.clear()  # Clear tasks for the next batch
+                # self.workout_new_keyphrases()
+                
+                self.processed_urls_count += batch_size
+                # Save checkpoint periodically
+                if self.processed_urls_count >= self.checkpoint_interval:
+                    self._save_checkpoint()
+                    self.processed_urls_count = 0  # Reset the counter after saving
+            # After all URLs are processed
             self._save_checkpoint()
 
 
