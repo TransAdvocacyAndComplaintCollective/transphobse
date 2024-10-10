@@ -14,7 +14,6 @@ from bs4 import BeautifulSoup
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
 from utils.keywords import KEYWORDS
-from tqdm import tqdm
 import urllib.parse
 
 
@@ -84,7 +83,6 @@ def save_checkpoint(checkpoint_data: Dict) -> None:
     try:
         with open(CHECKPOINT_FILE, "w") as f:
             json.dump(checkpoint_data, f, indent=4)
-        logging.info("Checkpoint data saved successfully.")
     except IOError as e:
         logging.error(f"Failed to save checkpoint: {e}")
 
@@ -216,7 +214,7 @@ def fetch_wayback(url_pattern: str, max_retries: int = 2, backoff_factor: int = 
     cached_entries = wayback_checkpoint.get("cached_cdx_entries", [])
     if cached_entries:
         logging.info("Processing cached Wayback CDX entries.")
-        for entry in tqdm(cached_entries, desc="Processing Cached Entries"):
+        for entry in cached_entries:
             url = entry.get("url")
             if url is None:
                 continue
@@ -239,7 +237,7 @@ def fetch_wayback(url_pattern: str, max_retries: int = 2, backoff_factor: int = 
         start_year = wayback_checkpoint.get("year", 1996) if wayback_checkpoint.get("mimetype") == mime[0] else 1996
         wayback_checkpoint["offset"] = 0
 
-        for year in tqdm(range(start_year, this_year + 1), desc=f"Processing Years"):
+        for year in range(start_year, this_year + 1):
             offset = wayback_checkpoint.get("offset", 0)
 
             while True:
@@ -270,7 +268,7 @@ def fetch_wayback(url_pattern: str, max_retries: int = 2, backoff_factor: int = 
                     break
 
                 if success and urls:
-                    for url in tqdm(urls, desc=f"Processing URLs for {year}"):
+                    for url in urls:
                         if url not in processed_urls:  # Skip if already processed
                             wayback_checkpoint.setdefault("cached_cdx_entries", []).append({"url": url, "mime": mime})
                             processed_urls.add(url)  # Mark as processed
@@ -334,7 +332,7 @@ def fetch_commoncrawl(
     cached_entries = commoncrawl_checkpoint.get("cached_cdx_entries", [])
     if cached_entries:
         logging.info("Processing cached Common Crawl CDX entries.")
-        for entry in tqdm(cached_entries, desc="Processing Cached Entries"):
+        for entry in cached_entries:
             if isinstance(entry, dict):  # Ensure entry is a dictionary
                 url = entry.get("url")
                 mime = entry.get("mime")
@@ -358,7 +356,7 @@ def fetch_commoncrawl(
 
     cdx_index = commoncrawl_checkpoint.get("cdx_index", 0)
 
-    for index in tqdm(range(cdx_index, len(cc_cdxs)), desc="Processing Common Crawl Indexes"):
+    for index in range(cdx_index, len(cc_cdxs)):
         cdx = cc_cdxs[index]
         base_url = cdx["cdx-api"]
         if base_url != commoncrawl_checkpoint.get("base_url"):
@@ -379,9 +377,7 @@ def fetch_commoncrawl(
                 continue
 
             offset = commoncrawl_checkpoint.get("offset", 0)
-
-            with tqdm(total=total_items, desc=f"Fetching {mime[0]} URLs") as pbar:
-                while offset < total_items:
+            while offset < total_items:
                     limit = min(min_limit, total_items - offset)
                     query_url = (
                         f"{base_url}?url={url_pattern}&output=json&fields=url&collapse=digest"
@@ -441,7 +437,6 @@ def fetch_commoncrawl(
                     commoncrawl_checkpoint["offset"] = offset
                     commoncrawl_checkpoint["processed_urls"] = list(urls)
                     save_checkpoint(checkpoint_data)
-                    pbar.update(limit)
 
             commoncrawl_checkpoint["offset"] = 0
             save_checkpoint(checkpoint_data)

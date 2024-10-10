@@ -9,7 +9,7 @@ import urllib.parse
 
 # Function to scan text for keywords
 def contains_keywords(text, bypass_anit=False):
-    final_score, keywords, anti_keywords = relative_keywords_score(text, bypass_anit)
+    final_score, keywords, anti_keywords, word_mached = relative_keywords_score(text, bypass_anit)
     if final_score > 0:
         return True, keywords
     return False, []
@@ -25,7 +25,7 @@ def pass_complaint_page(url, csv_writer):
         html_found, html_keywords = contains_keywords(html.get_text())
         if html_found:
             # Use find instead of find_all to avoid ResultSet issues
-            header_element = html.select_one("#block-bbc-contact-page-title > h1")
+            header_element = html.select_one("#block-bbc-contact-page-title")
             time_element = html.find("time")
             time = time_element.text if time_element else "Unknown Time"
             header = header_element.text if header_element else "Unknown Header"
@@ -110,5 +110,4 @@ def main():
                 print(f"Failed to fetch complaints page: {url} -> {e}")
                 break
 
-# Run the main function
 main()

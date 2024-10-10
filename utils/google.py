@@ -12,4 +12,4 @@ def lookup(keyword,domain):
         except Exception as e:
             print("Error",e)
             continue
-lookup("gender-critical feminism","bbc.co.uk")
+# lookup("gender-critical feminism","bbc.co.uk")

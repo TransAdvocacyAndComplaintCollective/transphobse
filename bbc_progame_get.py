@@ -1,7 +1,6 @@
 import requests
 from bs4 import BeautifulSoup
 import json
-from tqdm import tqdm  # For progress bar
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Define headers to mimic a browser request
@@ -76,7 +75,7 @@ def get_programme_urls():
         futures = {executor.submit(fetch_programme_urls, char): char for char in characters}
 
         # Adding a progress bar for URL fetching
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Fetching Programme URLs"):
+        for future in as_completed(futures):
             result = future.result()
             all_programme_urls.update(result)
 
@@ -156,7 +155,7 @@ def scrape_bbc_programmes():
         futures = {executor.submit(get_programme_details, programme_url.split('/')[-1]): programme_url for programme_url in all_programme_urls}
 
         # Adding a progress bar for fetching programme details
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Fetching Programme Details"):
+        for future in as_completed(futures):
             details = future.result()
             if details:
                 episodes = get_episodes(details['programme']['pid'])

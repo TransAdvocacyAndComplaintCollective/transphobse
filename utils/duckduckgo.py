@@ -1,19 +1,34 @@
-
 from time import sleep
 from duckduckgo_search import DDGS
+from duckduckgo_search.exceptions import RatelimitException 
+import random
 
-def lookup_duckduckgo(keyword,domain):
+def lookup_duckduckgo(keyword, domain):
     for i in range(10):
         try:
             ddgs = DDGS()
             text = f"{keyword} site:{domain}"
-            print(text)
-            results = ddgs.text(text, max_results=10)
+            results = ddgs.text(text)
             for result in results:
-                print(result)
                 yield result
-            break
+            return
+        except RatelimitException as e:
+            sleep(5)  # Retry delay if there is an error
+            return
         except Exception as e:
-            sleep(60*30)
-            print(dir(e))
-            print(e.args)
+            print("Error:", e)
+    
+
+def lookup_duckduckgos(keywords, domain):
+    random.shuffle(keywords)  # Shuffle keywords for randomness
+    for keyword in keywords:
+        cout = 0
+        for result in lookup_duckduckgo(keyword, domain):
+            if result is None:
+                return
+            cout += 1
+            print(cout)
+            yield result
+        if cout == 0:
+            return
+

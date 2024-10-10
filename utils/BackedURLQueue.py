@@ -171,6 +171,16 @@ class BackedURLQueue:
                 """, values)
             self.conn.commit()
             self.total_urls += 1
+            
+    def count_all(self) -> int:
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                f"""
+                SELECT COUNT(*) FROM {self.table_name}
+                """
+            )
+            return cursor.fetchone()[0]
     
     def set_page_score(self, url: str, score: float):
         """Set the page score for a given URL."""
@@ -186,7 +196,6 @@ class BackedURLQueue:
 
     def add(self, anchor_url, score, anchor_text:Optional[str] = None, page_type:Optional[str] = None, lastmod_sitemap:Optional[str] = None, changefreq_sitemap:Optional[str] = None, priority_sitemap:Optional[float] = None):
         """Add a URL to the queue with the given score. If the URL exists, update the score if the new one is higher."""
-        logger.info(f"Adding URL to the queue: {anchor_url} with score {score}")
         with self.lock:
             # Check if the URL already exists in the table
             current_score_row = self.conn.execute(
@@ -200,7 +209,6 @@ class BackedURLQueue:
                 # URL does not exist, insert it
                 url_item = URLItem(url=anchor_url, url_score=score)
                 self.push(url_item)
-                logger.info(f"Inserted new URL {anchor_url} with score {score}")
             else:
                 # URL exists, check if the new score is higher and update if needed
                 current_score = current_score_row[0]
@@ -213,9 +221,6 @@ class BackedURLQueue:
                         """, (score, anchor_url)
                     )
                     self.conn.commit()
-                    logger.info(f"Updated score for {anchor_url} to {score}")
-                else:
-                    logger.info(f"No update needed for {anchor_url}, score {score} is lower or equal to existing {current_score}.")
 
 
     def pop(self):
@@ -237,6 +242,8 @@ class BackedURLQueue:
                     url_item = URLItem.from_row(row)
                     if not url_item.url:  # Add a check for invalid URLs
                         logger.error("Invalid URL found during pop, skipping")
+                        # mark as seen
+                        self.mark_seen(url_item.url)
                         return None
 
                     self.mark_seen(url_item.url)

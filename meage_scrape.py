@@ -26,7 +26,6 @@ import feedparser
 import numpy as np
 import networkx as nx
 from sklearn.metrics.pairwise import cosine_similarity
-from tqdm import tqdm
 import yake
 from keybert import KeyBERT
 import concurrent.futures
@@ -319,7 +318,6 @@ class KeyPhraseFocusCrawler:
         # if normalized_url in self.seen_urls:
         #     logger.debug(f"Skipping already seen URL: {normalized_url}")
         #     return
-        logger.debug(f"Adding URL to queue: {normalized_url} with priority {priority}")
         self.urls_to_visit.add_or_update(URLItem(priority, normalized_url, url_type), priority)
         if priority > 0:
             logger.info(f"Added URL to queue: {url} with priority {priority} {url_type}")
@@ -656,7 +654,6 @@ class KeyPhraseFocusCrawler:
 
     async def _process_url(self, session, url):
         """Process the URL by fetching and analyzing its content in a separate thread."""
-        logger.info(f"Processing URL: {url}")
         text = await self._fetch(session, url)
 
         # Define the blocking work to be done in a thread
@@ -1222,7 +1219,6 @@ class KeyPhraseFocusCrawler:
                     # Get the next URL to process
                     url_item = self.urls_to_visit.pop()
                     print(url_item)
-                    logger.debug(f"Processing URLItem: {url_item}")
                     # Check robots.txt rules
                     o = urlparse(url_item.url)
                     if o.hostname in self.rob and not self.rob[o.hostname].can_fetch("*", url_item.url):
