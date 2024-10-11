@@ -650,13 +650,17 @@ class KeyPhraseFocusCrawler:
             links = bs.find_all("a", href=True)
             for link in links:
                 href = link["href"]
+                rel = link.get("rel", "")
                 if href.startswith("/"):
-                    # Convert relative URLs to absolute
                     href = urljoin(url, href)
 
                 # Ensure that score is an integer
                 score = ensure_int(score)
                 self.urls_to_visit.add(href, score)
+                if "canonical" in rel:
+                    self.urls_to_visit.mark_seen(href)
+                if "alternate" in rel:
+                    pass
                 logger.debug(f"Queued link {href} with score {score}")
         except Exception as e:
             logger.error(f"Failed to extract links from {url}: {e}")

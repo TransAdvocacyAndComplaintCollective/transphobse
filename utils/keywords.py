@@ -916,16 +916,13 @@ def smart_kay_prace_maching(
     phrase_embeddings = np.array([emb.cpu().numpy() for emb in phrase_embeddings])
     irrelevant_phrase_embeddings = np.array([emb.cpu().numpy() for emb in irrelevant_phrase_embeddings])
     text_embeddings_np = np.array([emb.cpu().numpy() for emb in text_embeddings])
-
     outputs = {}
-
     # Calculate similarity between text keywords and phrases
     for i, phrase_embedding in enumerate(phrase_embeddings):
         phrase = phrases[i]
 
         try:
             similarities = util.pytorch_cos_sim(text_embeddings_np, phrase_embedding).numpy().flatten()
-
             for j, similarity in enumerate(similarities):
                 if similarity > similarity_threshold and len(combined_keywords[j]) >= 5:
                     keyword = combined_keywords[j]
@@ -999,7 +996,8 @@ def relative_keywords_score(text: str,bypass_anit=False):
     
     final_score = score - anti_score
     if final_score < 0:
-        final_score , found_keywords =smart_kay_prace_maching(text, KEYWORDS, irrelevant_for_keywords)
+        score , found_keywords =smart_kay_prace_maching(text, KEYWORDS, irrelevant_for_keywords)
+        final_score = score - anti_score
 
 
     return final_score, list(set([kw for kw, _, _ in found_keywords])), list(set([kw for kw, _, _ in found_anti_keywords]))
