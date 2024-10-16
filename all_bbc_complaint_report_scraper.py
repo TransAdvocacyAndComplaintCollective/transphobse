@@ -11,7 +11,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
 import camelot
-from utils.keywords import relative_keywords_score
+from utils.keywords_finder import relative_keywords_score
 import re
 
 # Directories and configuration

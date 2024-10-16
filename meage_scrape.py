@@ -1,1299 +1,936 @@
 import asyncio
-from heapq import heappop, heappush
-import math
-import statistics
-from threading import Lock, RLock
-import aiohttp
-import json
+import datetime
+import importlib
 import os
-import pickle
-import logging
 import re
+import aiosqlite  # Changed to aiosqlite for async database operations
+import ssl
+import sys
+import aiohttp
+import logging
 import csv
-import urllib.robotparser
-from queue import PriorityQueue
-import networkx as nx
-import nltk
-from nltk.corpus import stopwords
-from nltk.stem import WordNetLemmatizer
+import json
+from urllib.parse import quote, unquote, urljoin, urlparse, urlunparse
 from bs4 import BeautifulSoup
-from readabilipy import simple_json_from_html_string, simple_tree_from_html_string
-import requests
-import spacy
-from sklearn.feature_extraction.text import TfidfVectorizer
-from urllib.parse import urljoin, urlparse
-import feedparser
-import numpy as np
-import networkx as nx
-from sklearn.metrics.pairwise import cosine_similarity
-import yake
-from keybert import KeyBERT
-import concurrent.futures
-from reddit import reddit_domain_scrape
-from utils.BackedURLQueue import SQLitePriorityQueue
+import certifi
+from readabilipy import simple_json_from_html_string
+import tqdm
+import chardet  # For character encoding detection
 
-# Download required NLTK resources
-nltk.download("punkt")
-nltk.download("averaged_perceptron_tagger")
-nltk.download("maxent_ne_chunker")
-nltk.download("words")
-nltk.download("stopwords")
+# Local imports
+from utils.bbc_scripe_cdx import get_all_urls_cdx
+from utils.duckduckgo import lookup_duckduckgos
+import utils.keywords as kw
+from utils.RobotsSql import RobotsSql
+from utils.SQLDictClass import SQLDictClass
+from utils.BackedURLQueue import BackedURLQueue, URLItem
+import traceback
+import feedparser
+from javascript import require
+import requests
+import utils.keywords_finder as kw_finder
+from utils.ovarit import ovarit_domain_scrape
+from utils.reddit import reddit_domain_scrape
+
+processArticle = require("./utils/ProcessArticle.js")
 
 # Initialize logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
-CHECKPOINT_FILE = "crawler_checkpoint.pkl"
 
-class UpdatablePriorityQueue:
-    """A custom priority queue that supports updating the priority of existing items, peeking, and more."""
-
-    def __init__(self, min_heap=True):
-        self.heap = []  # List of (priority, count, item) tuples
-        self.entry_finder = {}  # Mapping of items to their heap entry
-        self.REMOVED = '<removed-item>'  # Placeholder for a removed item
-        self.counter = 0  # Unique sequence count to handle same-priority items
-        self.min_heap = min_heap  # If False, use max-heap
-        logger.debug("Initialized UpdatablePriorityQueue")
-
-    def add_or_update(self, item, priority):
-        """Add a new item or update the priority of an existing item."""
-        logger.debug(f"Adding/updating item in queue: {item} with priority {priority}")
-        if item in self.entry_finder:
-            self.remove(item)
-        # For max-heap, we store negative priorities
-        actual_priority = priority if self.min_heap else -priority
-        entry = [actual_priority, self.counter, item]
-        self.counter += 1
-        self.entry_finder[item] = entry
-        heappush(self.heap, entry)
-
-    def remove(self, item):
-        """Remove an existing item from the queue."""
-        logger.debug(f"Removing item from queue: {item}")
-        entry = self.entry_finder.pop(item)
-        entry[-1] = self.REMOVED
-
-    def pop(self):
-        """Remove and return the lowest-priority item. Raise KeyError if empty."""
-        while self.heap:
-            priority, count, item = heappop(self.heap)
-            if item is not self.REMOVED:
-                del self.entry_finder[item]
-                logger.debug(f"Popped item from queue: {item}")
-                return item  # Return only the item, which is a URLItem object
-        raise KeyError('pop from an empty priority queue')
-
-    def peek(self):
-        """Return the lowest-priority item without removing it. Raise KeyError if empty."""
-        while self.heap:
-            priority, count, item = self.heap[0]
-            if item is not self.REMOVED:
-                return item, (priority if self.min_heap else -priority)
-            else:
-                heappop(self.heap)  # Remove the removed item
-        raise KeyError('peek from an empty priority queue')
-
-    def change_priority(self, item, new_priority):
-        """Change the priority of an existing item. Raises KeyError if not found."""
-        if item not in self.entry_finder:
-            raise KeyError(f'Item {item} not found in priority queue')
-        self.add_or_update(item, new_priority)
-
-    def get_priority(self, item):
-        """Return the current priority of the given item."""
-        if item in self.entry_finder:
-            entry = self.entry_finder[item]
-            return entry[0] if self.min_heap else -entry[0]
-        raise KeyError(f'Item {item} not found in priority queue')
-
-    def clear(self):
-        """Remove all items from the priority queue."""
-        self.heap.clear()
-        self.entry_finder.clear()
-
-    def all_items(self):
-        """Return a list of all items in the queue along with their priorities."""
-        return [
-            (item, (priority if self.min_heap else -priority))
-            for priority, count, item in self.heap
-            if item is not self.REMOVED
-        ]
-
-    def empty(self):
-        """Return True if the queue is empty."""
-        return not self.entry_finder
-
-    def __contains__(self, item):
-        """Check if an item is in the queue."""
-        return item in self.entry_finder
-
-    def __len__(self):
-        """Return the number of items in the queue."""
-        return len(self.entry_finder)
-    def have_been_seen(self, url):
-        """Check if the URL has been seen before."""
-        return url in self.seen_urls
+headers = {
+    "User-Agent": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/png,image/svg+xml,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Sec-GPC": "1",
+    "If-None-Match": 'W/"4226e-CWVsNkTGzsL1l//d1mu/AILkgTM"',
+    "Priority": "u=0, i",
+}
 
 
-class URLItem:
-    def __init__(self, priority, url, url_type):
-        self.priority = priority
-        self.url = url
-        self.url_type = url_type
+def ensure_int(value):
+    if isinstance(value, bytes):
+        return int.from_bytes(value, byteorder="big")
+    return int(value)
 
-    def __eq__(self, other):
-        return self.url == other.url
-
-    def __hash__(self):
-        return hash(self.url)
-
-    def __repr__(self):
-        return f'URLItem(priority={self.priority}, url="{self.url}", url_type="{self.url_type}")'
 
 class KeyPhraseFocusCrawler:
     def __init__(
         self,
         start_urls,
-        keywords,
-        anti_keywords,
-        allowed_subdirs,
-        output_csv="meage_crawler_results.csv",
-        feeds=[],
-        irrelevant_for_keywords = [],
-        irrelevant_for_anti_keywords = [],
+        feeds,
+        name,
+        allowed_subdirs_cruel=[],
+        keywords=[],
+        anti_keywords=[],
+        irrelevant_for_keywords=[],
+        seed_urls=[],
+        plugins=[],
+        start_data=None,
+        end_data=None,
+        exclude_lag=[],
+        exclude_subdirs_cruel=None,
+        exclude_subdirs_scrape=None,
+        allow_for_recruiting=False,
+        max_limit=500,
     ):
-        Checkpointing()
-        CrawlerDatabase()
-        SQLitePriorityQueue()
-        self.processed_urls_count = 0  # Initialize the processed URLs counter
-        self.checkpoint_file ="crawler_checkpoint_meage.pkl"
-        self.checkpoint_interval =600
+        self.seed_urls = seed_urls
+        self.feeds = feeds
+        self.allow_for_recruiting = allow_for_recruiting
+        self.start_data = start_data
+        self.end_data = end_data
+        self.exclude_lag = exclude_lag
+        self.exclude_subdirs_cruel = exclude_subdirs_cruel
+        self.exclude_subdirs_scrape = exclude_subdirs_scrape
         self.irrelevant_for_keywords = irrelevant_for_keywords
-        self.irrelevant_for_anti_keywords = irrelevant_for_anti_keywords
-        self.start_urls = start_urls
+        self.irrelevant_for_anti_keywords = []
+
+        # Use aiosqlite for asynchronous database access
+        self.conn = None  # Initialize connection to None
+        self.robots = None
+        self.keyphrases = None
+        self.urls_to_visit = None
+
+        self.plugins = plugins
+        self.allowed_subdirs_cruel = allowed_subdirs_cruel
         self.keywords = keywords
         self.anti_keywords = anti_keywords
-        self.allowed_subdirs = allowed_subdirs
-        self.lockfs = Lock()
-        self.output_csv = output_csv
-        self.feeds = feeds
-        self.urls_to_visit = UpdatablePriorityQueue()
-        self.seen_urls = set()
-        self.graph = nx.DiGraph()
-        self.host = {}
-        self.stop_words = set(stopwords.words("english"))
-        self.nlp = spacy.load("en_core_web_sm")
-        self.pythonJsLock = RLock()
-        self.dict_lock = RLock()
-        self.keyphrases = {}
-        self.good = 0
-        self.bad = 0
-        self.rob = {}
-        self._load_checkpoint()
-        self._initialize_output_csv()
-        self._initialize_urls()
-        # Initialize NLP models and other tools
-        self.nlp = spacy.load("en_core_web_sm")
-        self.kw_model = KeyBERT()
-
-
-    def _save_checkpoint(self):
-        """Save the current state of the crawler to a checkpoint file."""
-        try:
-            state = {
-                'urls_to_visit': self.urls_to_visit,
-                'seen_urls': self.seen_urls,
-                'graph': self.graph,
-                'host': self.host,
-                'keyphrases': self.keyphrases,
-                'good': self.good,
-                'bad': self.bad
-            }
-            with open(self.checkpoint_file, 'wb') as f:
-                pickle.dump(state, f)
-            logger.info(f"Checkpoint saved to {self.checkpoint_file}")
-        except Exception as e:
-            logger.error(f"Error saving checkpoint: {e}")
-
-    def _load_checkpoint(self):
-        """Load the crawler state from a checkpoint file if it exists."""
-        if os.path.exists(self.checkpoint_file):
-            try:
-                with open(self.checkpoint_file, 'rb') as f:
-                    state = pickle.load(f)
-                    self.urls_to_visit = state['urls_to_visit']
-                    self.seen_urls = state['seen_urls']
-                    self.graph = state['graph']
-                    self.host = state['host']
-                    self.keyphrases = state['keyphrases']
-                    self.good = state['good']
-                    self.bad = state['bad']
-                logger.info(f"Resumed from checkpoint: {self.checkpoint_file}")
-            except Exception as e:
-                logger.error(f"Error loading checkpoint: {e}")
+        self.output_csv = f"data/{name}.csv"
+        self.file_db = f"databases/{name}.db"
+        self.semaphore = asyncio.Semaphore(max_limit)
+        self.processed_urls_count = 0
+        self.start_urls = start_urls
+        self.name = name  # Save the name for database connection
+        self.csv_file = None  # File handle for CSV
+        self.csv_writer = None  # CSV writer
+        # Initialize output CSV and plugins will be done in crawl_start
 
     def _initialize_output_csv(self):
-        """Initialize the output CSV file."""
-        self.csv_file = open(self.output_csv, mode="a", newline="", buffering=1)
-        self.csv_writer = csv.writer(self.csv_file)
-        with self.lockfs:
-            if self.csv_file.tell() == 0:
+        """Ensure the CSV file is properly initialized with the correct headers."""
+        try:
+            self.csv_file = open(self.output_csv, mode="a", newline="", buffering=1, encoding="utf-8")
+            self.csv_writer = csv.writer(self.csv_file)
+            if os.path.getsize(self.output_csv) == 0:
+                # These are the headers you want to add to the CSV
                 self.csv_writer.writerow(
                     [
-                        "URL",
-                        "Score",
-                        "Keywords Found",
-                        "type_page",
-                        "description",
-                        "headline",
-                        "datePublished",
-                        "dateModified",
-                        "author",
-                        "new_keyphrases",
+                        "URL",  # The URL of the page
+                        "Score",  # The relevance score
+                        "Keywords Found",  # The keywords found on the page
+                        "headline",  # The headline of the page (if it's an article)
+                        "datePublished",  # The publication date of the page
+                        "author",  # The author of the page
+                        "byline",  # The byline (author details or credits)
                     ]
                 )
-
-    def _initialize_urls(self):
-        """Initialize start URLs and add them to the queue."""
-        logger.info("Initializing start URLs and adding them to the queue.")
-
-        def process_url(url):
-            """Process a single URL and add it to the queue."""
-            logger.debug(f"Processing start URL: {url}")
-            self._add_to_queue(url, "start", priority=0)
-            domain = urlparse(url).netloc
-            self.host[domain] = self.pass_robot(url)
-            # Scrape Ovarit domain URLs
-            try:
-                site_urls = list(ovarit_domain_scrape(domain))  # Convert generator to list
-                logger.info(f"Scraped {len(site_urls)} URLs from Ovarit domain: {domain}")
-                for site_url in site_urls:
-                    score, found_keywords, _ = self.relative_score(site_url[1])
-                    if url in site_url[0]:
-                        self._add_to_queue(site_url[0], "start", priority=score)
-            except Exception as e:
-                logger.error(f"Error scraping Ovarit domain {domain}: {e}")
-
-            # Scrape Reddit domain URLs
-            try:
-                site_urls = list(reddit_domain_scrape(domain))  # Convert generator to list
-                logger.info(f"Scraped {len(site_urls)} URLs from Reddit domain: {domain}")
-                for site_url in site_urls:
-                    score, found_keywords, _ = self.relative_score(site_url[1])
-                    if url in site_url[0]:
-                        self._add_to_queue(site_url[0], "start", priority=score)
-            except Exception as e:
-                logger.error(f"Error scraping Reddit domain {domain}: {e}")
-
-        # Start processing URLs concurrently using ThreadPoolExecutor
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            futures = [executor.submit(process_url, url) for url in self.start_urls]
-            concurrent.futures.wait(futures)
-            logger.info(f"Completed processing initial URLs using ThreadPoolExecutor.")
-
-        # Process feeds separately in a single-threaded manner
-        for feed in self.feeds:
-            self._add_to_queue(feed, "feed", priority=0)
-
-    def pass_robot(self, url):
-        """Check if the URL passes the robots.txt."""
-        parsed_url = urlparse(url)
-        robots_url = f"{parsed_url.scheme}://{parsed_url.netloc}/robots.txt"
-        try:
-            response = requests.get(robots_url)
-            if response.status_code == 200:
-                rob = urllib.robotparser.RobotFileParser()
-                rob.parse(response.text.splitlines())
-                self.rob[parsed_url.hostname] = rob
-                return rob
         except Exception as e:
-            logger.error(f"Error fetching robots.txt for {url}: {e}")
-        return None
+            logger.error(f"Error initializing CSV file: {e}")
 
-    def _add_to_queue(self, url, url_type, priority=0):
-        """Add a URL to the queue if it hasn't been visited, with a given priority."""
-        normalized_url = self._normalize_url(url)
-        # if normalized_url in self.seen_urls:
-        #     logger.debug(f"Skipping already seen URL: {normalized_url}")
-        #     return
-        self.urls_to_visit.add_or_update(URLItem(priority, normalized_url, url_type), priority)
-        if priority > 0:
-            logger.info(f"Added URL to queue: {url} with priority {priority} {url_type}")
-    
-    def combine_keywords(self, items, is_correlate, found_keywords, found_anit_keywords, similarity_threshold=0.8, non_matching_similarity_threshold=0.5):
-        """
-        Combines keywords into a single dictionary, accumulating their scores and counts,
-        merges similar keywords based on cosine similarity using TF-IDF, and adds non-matching but similar texts.
+    def _initialize_plugins(self):
+        """Initialize and execute the `on_start` method of all plugins."""
+        for plugin in self.plugins:
+            plugin.on_start(self)
 
-        Args:
-            items (dict): A dictionary of keyphrases with associated data.
-            is_correlate (bool): A flag indicating whether to mark the items as correlates or non-correlates.
-            found_keywords (list): List of keywords found in the text that match the keyphrases.
-            similarity_threshold (float): The threshold above which two keywords are considered similar.
-            non_matching_similarity_threshold (float): The threshold above which non-matching but similar texts are stored.
-        """
-        logger.info(f"Combining {len(items)} keywords with correlation type: {'correlate' if is_correlate else 'non-correlate'}")
+    def _apply_after_fetch_plugins(self, url, content):
+        """Run `after_fetch` on all plugins."""
+        for plugin in self.plugins:
+            content = plugin.after_fetch(url, content, self)
+        return content
 
-        # Prepare the corpus for TF-IDF vectorization
-        new_keywords = list(items.keys())
-        existing_keywords = list(self.keyphrases.keys())
+    async def _apply_before_fetch_plugins(self):
+        """Execute the `before_fetch` method of all plugins."""
+        for plugin in self.plugins:
+            await plugin.before_fetch(self)
 
-        # Skip processing if no new keywords
-        if not new_keywords:
-            logger.info("No new keywords to process.")
-            return
+    async def _initialize_urls(self, start_urls, feeds=[], seed_urls=[]):
+        seen = set()  # To keep track of seen URLs
+        for url in start_urls:
+            # Add start URL to the queue
+            await self._add_to_queue(url, "start", priority=0)
 
-        # Combine all keywords for vectorization
-        corpus = new_keywords + existing_keywords
-        vectorizer = TfidfVectorizer().fit(corpus)
+            o = urlparse(url)
 
-        # Calculate TF-IDF vectors for new and existing keywords in a single operation
-        all_vectors = vectorizer.transform(corpus).toarray()
-        new_vectors = all_vectors[:len(new_keywords)]
-        existing_vectors = all_vectors[len(new_keywords):] if existing_keywords else None
+            # DuckDuckGo lookup
+            for duck in lookup_duckduckgos(self.keywords, o.hostname):
+                print("duckduckgo", duck)
+                title = duck.get("title")
+                body = duck.get("body")
+                href = duck.get("href")
+                final_score = 0
 
-        
-            # Update keywords dictionary with provided items
-        for i, (ke, item_data) in enumerate(items.items()):
-                text = item_data["text"]
-                score = item_data["score"]
-                tag = item_data["tag"]
-                keyword_type = item_data["type"]
-                count_terms = item_data["count"]
-
-                # Count the number of found keywords that match this keyphrase
-                found_keywords_count = sum(1 for kw in found_keywords if kw in text)
-                found_anit_keywords_count = sum(1 for kw in found_anit_keywords if kw in text)
-                with self.dict_lock:
-                    if text in self.keyphrases:
-                        # If the keyphrase already exists, update its data
-                            self._update_existing_keyword(text, score, tag, keyword_type, count_terms, found_keywords_count, found_anit_keywords_count, is_correlate)
+                if title:
+                    temp_score, _, _ = kw_finder.relative_keywords_score(title)
+                if body:
+                    temp_score2, _, _ = kw_finder.relative_keywords_score(body)
+                    if temp_score2 > temp_score:
+                        final_score = temp_score2
                     else:
-                        # Check for similar existing keywords to merge
-                        should_merge = False
-                        new_vector = new_vectors[i]
+                        final_score = temp_score
+                else:
+                    final_score = temp_score
 
-                        # Perform similarity calculation outside the lock
-                        similar_entry, max_similarity = self._find_similar_existing_keyword(existing_keywords, existing_vectors, new_vector, similarity_threshold)
+                await self._add_to_queue(href, "webpage", priority=final_score)
 
-                        if similar_entry:
-                            # Perform merging inside the lock
-                            self._merge_with_existing_keyword(similar_entry, text, score, tag, keyword_type, count_terms, found_keywords_count, found_anit_keywords_count, is_correlate, max_similarity)
-                            should_merge = True
+            # Reddit domain scrape
+            for new_url in reddit_domain_scrape(o.hostname):
+                if new_url[0] in seen:
+                    continue
+                seen.add(new_url[0])
+                final_score, _, _ = kw_finder.relative_keywords_score(new_url[1])
+                await self._add_to_queue(new_url[0], "webpage", priority=final_score)
 
-                        if not should_merge:
-                                # Add a new keyword if no similar one is found
-                                self._add_new_keyword(text, score, tag, keyword_type, count_terms, found_keywords_count, found_anit_keywords_count, is_correlate)
+            # Ovarit domain scrape
+            for new_url in ovarit_domain_scrape(o.hostname):
+                if new_url[0] in seen:
+                    continue
+                seen.add(new_url[0])
+                final_score, _, _ = kw_finder.relative_keywords_score(new_url[1])
+                await self._add_to_queue(new_url[0], "webpage", priority=final_score)
 
+            # CDX URL scraping
+            for new_url in get_all_urls_cdx(o.hostname):
+                if new_url in seen:
+                    continue
+                seen.add(new_url)
+                await self._add_to_queue(new_url, "webpage")
 
-    def _update_existing_keyword(self, text, score, tag, keyword_type, count_terms, found_keywords_count, found_anit_keywords_count, is_correlate):
-        """Update an existing keyword entry with new data."""
-        logger.debug(f"Updating existing keyword: {text}")
-        existing_entry = self.keyphrases[text]
-        existing_entry["score"].append(score)  # Add score to list
-        existing_entry["count"] += 1  # Increment total count
-        existing_entry["count_terms"] += count_terms  # Increment count terms
-        existing_entry["found_keywords_count"] += found_keywords_count  # Increment found keywords count
-        existing_entry["found_anit_keywords_count"] += found_anit_keywords_count  # Increment found anti-keywords count
+        # Add feeds
+        for feed in feeds:
+            await self._add_to_queue(feed, "feed", priority=0)
 
-        # Increment correlate or non-correlate count
-        if is_correlate:
-            existing_entry["correlate_count"] += 1
-        else:
-            existing_entry["non_correlate_count"] += 1
+        # Add seed URLs with their scores
+        for seed_url in seed_urls:
+            await self._add_to_queue(seed_url["URL"], "webpage", priority=seed_url["Score"])
 
-        # Update tag if not already present
-        if tag not in existing_entry["tag"]:
-            existing_entry["tag"] += f", {tag}"
-
-        # Update type only if not 'ner' (Named Entity Recognition) type
-        if existing_entry["type"] != "ner":
-            existing_entry["type"] = keyword_type
-
-        logger.debug(f"Updated existing keyword: {text} with new score and counts.")
-
-
-    def _find_similar_existing_keyword(self, existing_keywords, existing_vectors, new_vector, similarity_threshold):
-        """Find a similar existing keyword based on cosine similarity."""
-        logger.debug("Finding similar existing keywords for merging.")
-        if existing_vectors is not None:
-            similarities = cosine_similarity([new_vector], existing_vectors).flatten()
-
-            # Find the most similar keyword above the threshold
-            max_similarity_idx = np.argmax(similarities)
-            max_similarity = similarities[max_similarity_idx]
-
-            if max_similarity >= similarity_threshold:
-                existing_text = existing_keywords[max_similarity_idx]
-                logger.debug(f"Found similar existing keyword: {existing_text} (similarity: {max_similarity:.2f})")
-                return existing_text, max_similarity
-        return None, 0
-
-
-    def _merge_with_existing_keyword(self, existing_text, text, score, tag, keyword_type, count_terms, found_keywords_count, found_anit_keywords_count, is_correlate, max_similarity):
-        """Merge a new keyword with an existing one if they are similar enough."""
-        logger.debug(f"Merging new keyword: {text} with existing keyword: {existing_text} (similarity: {max_similarity:.2f})")
-        existing_entry = self.keyphrases[existing_text]
-
-        # Merge the new keyphrase with the existing one
-        existing_entry["score"].append(score)  # Add score to list
-        existing_entry["count"] += 1  # Increment total count
-        existing_entry["count_terms"] += count_terms  # Increment count terms
-        existing_entry["found_keywords_count"] += found_keywords_count  # Increment found keywords count
-        existing_entry["found_anit_keywords_count"] += found_anit_keywords_count  # Increment found anti-keywords count
-
-        # Increment correlate or non-correlate count
-        if is_correlate:
-            existing_entry["correlate_count"] += 1
-        else:
-            existing_entry["non_correlate_count"] += 1
-
-        # Update tag if not already present
-        if tag not in existing_entry["tag"]:
-            existing_entry["tag"] += f", {tag}"
-
-        # Update type only if not 'ner' (Named Entity Recognition) type
-        if existing_entry["type"] != "ner":
-            existing_entry["type"] = keyword_type
-
-        logger.debug(f"Merged new keyword: {text} with existing keyword: {existing_text}")
-
-
-    def _add_new_keyword(self, text, score, tag, keyword_type, count_terms, found_keywords_count, found_anit_keywords_count, is_correlate):
-        """Add a new keyword entry to the keyphrases dictionary."""
-        logger.debug(f"Adding new keyword: {text}")
-        self.keyphrases[text] = {
-            "text": text,
-            "score": [score],
-            "tag": tag,
-            "type": keyword_type,
-            "count": 1,  # Initialize total count
-            "count_terms": count_terms,
-            "found_keywords_count": found_keywords_count,  # Initialize found keywords count
-            "found_anit_keywords_count": found_anit_keywords_count,  # Initialize found anti-keywords count
-            "correlate_count": 1 if is_correlate else 0,  # Initialize correlate count
-            "non_correlate_count": 0 if is_correlate else 1,  # Initialize non-correlate count
-            "similar_texts": []  # Initialize empty list for similar texts
-        }
-        logger.debug(f"Added new keyword: {text} with initial data.")
-    def workout_new_keyphrases(self):
-        """
-        Discover and write new key phrases to a CSV file by comparing correlated and non-correlated contexts.
-        This method uses TF-IDF and cosine similarity to filter out redundant or less relevant phrases.
-        """
-        logger.info("Starting the process of discovering new key phrases.")
-
-        # Prepare the keywords and anti-keywords sets for quick lookup
-        keywords_set = set(self.keywords)
-        anti_keywords_set = set(self.anti_keywords)
-
-        # Separate correlated and non-correlated texts for processing
-        correlates_texts = [" ".join([key for key, data in self.keyphrases.items() if data['correlate_count'] > 0])]
-        non_correlates_texts = [" ".join([key for key, data in self.keyphrases.items() if data['non_correlate_count'] > 0])]
-        combined_texts = correlates_texts + non_correlates_texts
-
-        # Ensure there is data to process
-        if not any(combined_texts):
-            logger.warning("No text data available for TF-IDF vectorization.")
+    async def _add_to_queue(self, url, url_type, priority=0):
+        if url is None:
             return
+        normalized_url = self.normalize_url(url)
 
-        logger.info("Calculating TF-IDF vectors for key phrases.")
-        # Calculate TF-IDF vectors for all keyphrases
-        all_keyphrases = list(self.keyphrases.keys())
-        vectorizer = TfidfVectorizer().fit(all_keyphrases)
+        # Exclude URLs from excluded subdirectories
+        for exclude_subdir in self.exclude_subdirs_cruel:
+            if exclude_subdir in normalized_url:
+                return
 
-        # Open the CSV file for appending
+        if not self.is_valid_url(normalized_url):
+            logger.error(f"Invalid URL found: {url}")
+            return
+        if not (await self.urls_to_visit.have_been_seen(normalized_url)):
+            url_item = URLItem(
+                url=normalized_url, url_score=priority, page_type=url_type
+            )
+            await self.urls_to_visit.push(url_item)
+
+    def is_valid_url(self, url):
         try:
-            with open("new_keyphrases.csv", mode="w", newline="") as f:
-                csv_writer = csv.writer(f)
+            parsed = urlparse(url)
+            return all([parsed.scheme, parsed.netloc])
+        except ValueError:
+            return False
 
-                # Write header if file is empty
-                if f.tell() == 0:
-                    csv_writer.writerow([
-                        "Keyphrase", "Tag", "Type", "Keywords Matched", "Anti-Keywords Matched",
-                        "Average Score Correlate", "Average Score Non-Correlate",
-                        "Std Dev Score Correlate", "Std Dev Score Non-Correlate",
-                        "Most Similar Non-Correlate Phrase", "Similarity Score", "Related Keywords", "Similar Texts",
-                        "Found Keywords Count", "Found Anti-Keywords Count"
-                    ])
-                    logger.info("CSV header written.")
+    def convert_archive_url(self, archive_url):
+        """Convert a Web Archive URL to its live version."""
+        if "web.archive.org" in archive_url:
+            # Find the position after the date part in the archive URL
+            live_url_start = archive_url.find("/https://") + 1
+            # Extract the live URL
+            live_url = archive_url[live_url_start:]
+            return live_url
+        return archive_url
 
-                # Process each correlated keyphrase
-                for keyphrase, data in self.keyphrases.items():
-                    if data['correlate_count'] == 0:
-                        logger.debug(f"Skipping non-correlate keyphrase: {keyphrase}")
-                        continue  # Skip non-correlate phrases
+    def normalize_url(self, url):
+        """Normalize and clean the URL."""
+        # First, convert archive URL if necessary
+        url = self.convert_archive_url(url)
 
-                    logger.info(f"Processing keyphrase: {keyphrase}")
-                    # Initialize bad count
-                    bad_count = 0
+        # Then proceed to normalize the URL
+        parsed_url = urlparse(url)
+        scheme = parsed_url.scheme.lower()
+        hostname = parsed_url.hostname.lower() if parsed_url.hostname else None
+        path = unquote(parsed_url.path).rstrip("/") + "/"
+        port = parsed_url.port
 
-                    # Compute similarity metrics
-                    most_similar_non_correlate = None
-                    highest_similarity_score = 0
+        if (scheme == "http" and port == 80) or (scheme == "https" and port == 443):
+            port = None
 
-                    # Compute bad count using similarity with non-correlated keyphrases
-                    for non_keyphrase, non_data in self.keyphrases.items():
-                        if non_data['non_correlate_count'] == 0:
-                            continue  # Skip correlate phrases
-
-                        # Calculate cosine similarity between the correlated and non-correlated keyphrase
-                        similarity = cosine_similarity(
-                            vectorizer.transform([keyphrase]),
-                            vectorizer.transform([non_keyphrase])
-                        )[0][0]
-
-                        # Update the most similar non-correlate keyphrase
-                        if similarity > highest_similarity_score:
-                            highest_similarity_score = similarity
-                            most_similar_non_correlate = non_keyphrase
-
-                        # Weight the bad count by similarity
-                        if similarity > 0.6:  # Example threshold for similarity
-                            bad_count += (non_data["count_terms"] / non_data["non_correlate_count"]) * similarity
-
-                    # Calculate average scores and standard deviations
-                    avg_score_correlate = (
-                        np.mean(data["score"]) if data["correlate_count"] > 0 else 0
-                    )
-                    avg_score_non_correlate = (
-                        np.mean(data["score"]) if data["non_correlate_count"] > 0 else 0
-                    )
-                    std_dev_score_correlate = (
-                        np.std(data["score"]) if data["correlate_count"] > 0 else 0
-                    )
-                    std_dev_score_non_correlate = (
-                        np.std(data["score"]) if data["non_correlate_count"] > 0 else 0
-                    )
-
-                    # Prepare related keywords for output
-                    related_keywords = ', '.join(data.get("related_keywords", []))
-
-                    # Determine keyword and anti-keyword matches
-                    keyword_match = [key for key in keywords_set if key.lower() in keyphrase.lower()]
-                    anti_keyword_match = [key for key in anti_keywords_set if key.lower() in keyphrase.lower()]
-
-                    # Write new keyphrase data to the CSV
-                    csv_writer.writerow([
-                        keyphrase,
-                        data["tag"],
-                        data["type"],
-                        ', '.join(keyword_match),
-                        ', '.join(anti_keyword_match),
-                        avg_score_correlate,
-                        avg_score_non_correlate,
-                        std_dev_score_correlate,
-                        std_dev_score_non_correlate,
-                        most_similar_non_correlate,
-                        highest_similarity_score,
-                        related_keywords,
-                        json.dumps(data.get("similar_texts", [])),  # Convert similar texts to JSON string
-                        data["found_keywords_count"],
-                        data["found_anit_keywords_count"]
-                    ])
-                    logger.info(f"Keyphrase {keyphrase} processed and written to CSV.")
-        except Exception as e:
-            logger.error(f"An error occurred while processing keyphrases: {e}")
-
-
-    def extract_entities_with_types(self, text):
-        """Extract named entities and their types using spaCy."""
-        logger.info("Extracting named entities with types.")
-        # Process the input text with spaCy's NLP model
-        try:
-            doc = self.nlp(text)
-            entities_with_types = [(ent.text, ent.label_) for ent in doc.ents]
-            logger.info(f"Extracted {len(entities_with_types)} entities from text.")
-        except Exception as e:
-            logger.error(f"Error extracting entities: {e}")
-            entities_with_types = []
-
-        return entities_with_types
-
-
-    def _normalize_url(self, url):
-        """Normalize the URL by removing fragments and trailing slashes."""
-        logger.debug(f"Normalizing URL: {url}")
-        normalized_url = url.split("#")[0].rstrip("/")
-        logger.debug(f"Normalized URL: {normalized_url}")
+        normalized_url = urlunparse(
+            (
+                scheme,
+                f"{hostname}:{port}" if port else hostname,
+                quote(path),
+                "",
+                "",
+                "",
+            )
+        )
         return normalized_url
 
+    async def _fetch(self, session, url_item):
+        url = url_item.url
+        if not self.is_valid_url(url):
+            logger.error(f"Invalid URL fetched from the queue: {url}")
+            return None, None, None
 
-    def _is_allowed_domain(self, url):
-        """Check if the URL belongs to an allowed domain."""
-        logger.debug(f"Checking if URL is allowed: {url}")
-        for subdir in self.allowed_subdirs:
-            if subdir in url:
-                logger.debug(f"URL is allowed: {url}")
-                return True
-        logger.debug(f"URL is not allowed: {url}")
-        return False
-
-
-    def _normalize_url(self, url):
-        """Normalize the URL by removing fragments and trailing slashes."""
-        return url.split("#")[0].rstrip("/")
-
-
-    async def _fetch(self, session, url):
-        """Fetch a URL using aiohttp session."""
-        async with self.semaphore:
+        mime = None
+        for i in range(5):  # Reduced retries from 20 to 5
             try:
-                logger.debug(f"Fetching URL: {url}")
-                async with session.get(url) as response:
-                    if response.status == 200:
-                        logger.info(f"Successfully fetched URL: {url}")
-                        return await response.text()
-                    else:
-                        logger.warning(f"Failed to fetch URL {url}, status: {response.status}")
-            except Exception as e:
-                logger.error(f"Error fetching URL {url}: {e}")
-        return None
+                    ssl_context = ssl.create_default_context(cafile=certifi.where())
+                    async with session.get(
+                        url, ssl=ssl_context, headers=headers, timeout=60
+                    ) as response:
+                        mime = response.headers.get("Content-Type")
 
-    async def _process_url(self, session, url):
-        """Process the URL by fetching and analyzing its content in a separate thread."""
-        text = await self._fetch(session, url)
-
-        # Define the blocking work to be done in a thread
-        def process_url_content(text, url):
-            if text:
-                logger.debug(f"Fetched content for URL: {url}, analyzing content.")
-                bs = BeautifulSoup(text, "html.parser")
-
-                metadata = self.extract_metadata(bs)
-                logger.debug(f"Extracted metadata for URL: {url} - {metadata}")
-
-                # Remove unwanted elements: scripts, styles, and comments
-                for script_or_style in bs(["script", "style"]):
-                    script_or_style.decompose()
-
-                # Extract the cleaned text
-                with self.pythonJsLock:
-                    article = simple_json_from_html_string(str(text), use_readability=True)
-                if article["content"] is not None:
-                    bs = BeautifulSoup(article["content"], "html.parser")
-                    text_content = bs.get_text(separator=" ")
-                    score, found_keywords, found_anit_keywords = self.relative_score(text_content)
-                    logger.debug(f"Extracted text content for URL: {url} with score: {score}")
-                else:
-                    text_content = bs.get_text(separator=" ")
-                    score, found_keywords, found_anit_keywords = self.relative_score(text_content)
-                    logger.debug(f"Extracted raw text content for URL: {url} with score: {score}")
-
-                # Extract extract_key_phrases from the page text
-                new_keyphrases = self.extract_key_phrases(text_content)
-                logger.info(f"Extracted key phrases for URL: {url}")
-
-                # Update graph and log information
-                self.update_graph_node(url, score, found_keywords)
-                logger.debug(f"Updated graph node for URL: {url} with score: {score}")
-
-                # Extract and process links
-                def find_link(link):
-                    href = link.get("href")
-                    rel = link.get("rel")
-                    mimetype = link.get("type")
-                    if href:
-                        full_url = urljoin(url, href)
-                        if self._is_allowed_domain(self._normalize_url(full_url)):
-                            if rel and "prev" in rel:
-                                self.urls_to_visit.add_or_update(URLItem(score, full_url, "webpage"), score)
-                            elif rel and "next" in rel:
-                                self.urls_to_visit.add_or_update(URLItem(score, full_url, "webpage"), score)
-                            elif rel and "alternate" in rel and mimetype is None:
-                                self.seen_urls.add(full_url)
-                            elif rel and "alternate" in rel and "rss" in mimetype:
-                                self.urls_to_visit.add_or_update(URLItem(0, full_url, "feed"), 0)
-                            elif rel and "alternate" in rel and "atom" in mimetype:
-                                self.urls_to_visit.add_or_update(URLItem(0, full_url, "feed"), 0)
-                            elif rel and "canonical" in rel:
-                                self.seen_urls.add(full_url)
-                            elif rel and "amphtml" in rel:
-                                self.seen_urls.add(full_url)
-                            elif rel and "bookmark" in rel:
-                                self.seen_urls.add(full_url)
-                def find_A(link):
-                    href = link.get("href")
-                    rel = link.get("rel")
-                    text = link.get_text()
-                    mimetype = link.get("type")
-                    score_link, found_keywords, found_anit_keywords = self.relative_score(text)
-                    if href:
-                        full_url = urljoin(url, href)
-                        if self._is_allowed_domain(self._normalize_url(full_url)):
-                            if rel and "prev" in rel:
-                                self.urls_to_visit.add_or_update(URLItem(score_link, full_url, "webpage"), score_link)
-                            elif rel and "next" in rel:
-                                self.urls_to_visit.add_or_update(URLItem(score_link, full_url, "webpage"), score_link)
-                            elif rel and "alternate" in rel and mimetype is None:
-                                self.seen_urls.add(full_url)
-                            elif rel and "alternate" in rel and "rss" in mimetype:
-                                self.urls_to_visit.add_or_update(URLItem(0, full_url, "feed"), score_link)
-                            elif rel and "alternate" in rel and "atom" in mimetype:
-                                self.urls_to_visit.add_or_update(URLItem(0, full_url, "feed"), score_link)
-                            elif rel and "canonical" in rel:
-                                self.seen_urls.add(full_url)
-                            elif rel and "amphtml" in rel:
-                                self.seen_urls.add(full_url)
-                            elif rel and "bookmark" in rel:
-                                self.seen_urls.add(full_url)
-                            else:
-                                self.urls_to_visit.add_or_update(URLItem(score_link, full_url, "webpage"), score_link)
-
-
-                for link in bs.find_all("link"):
-                    find_link(link)  
-                for link in bs.find_all("a"):
-                    find_A(link)
-
-                # Write results to CSV
-                if score > 0:
-                    # self.combine_keywords(new_keyphrases, is_correlate=True, found_keywords=found_keywords, found_anit_keywords=found_anit_keywords)
-                    self.good += 1
-                    logger.info(f"URL {url} processed with positive score {score}. Writing to CSV.")
-                    if isinstance(new_keyphrases, np.ndarray):  # Check if it's a NumPy array
-                        new_keyphrases = new_keyphrases.tolist()  # Convert to list
-                        with self.lockfs:
-                            self.csv_writer.writerow([
-                                url, score, found_keywords, metadata["type_page"], metadata["description"],
-                                metadata["headline"], metadata["datePublished"], metadata["dateModified"], metadata["author"],
-                                json.dumps(new_keyphrases)
-                            ])
-                    else:
-                        print("on no")
-                else:
-                    # self.combine_keywords(new_keyphrases, is_correlate=False, found_keywords=found_keywords, found_anit_keywords=found_anit_keywords)
-                    self.bad += 1
-                    logger.info(f"URL {url} processed with negative score {score}. Keywords combined as non-correlate.")
-
-                return url, score, found_keywords, metadata, new_keyphrases
-            return None, 0, [], {}, {}
-
-        # If text is available, process it in a thread
-        if text:
-            await asyncio.to_thread(process_url_content, text, url)
-        else:
-            logger.warning(f"Failed to fetch content for URL: {url}")
-
-    def relative_score(self, text):
-        """
-        Calculate the relevance score of a page or anchor text based on keywords and key phrases,
-        handling both relevant and irrelevant keywords with context-aware logic and preventing substring conflicts.
-        """
-        # Initialize scoring variables
-        score = 0
-        anti_score = 0
-        relevant_window = 50  # Number of characters around a keyword to check for irrelevant content
-
-        # Prepare containers for processing keywords and positions
-        found_keywords = []
-        found_anti_keywords = []
-
-        # Function to determine if a segment of text contains any irrelevant phrases
-        def contains_irrelevant(phrases, segment):
-            return any(re.search(r'\b' + re.escape(phrase) + r'\b', segment, re.IGNORECASE) for phrase in phrases)
-
-        # Function to determine if a word should be counted as relevant
-        def is_relevant(word, irrelevant_phrases):
-            # Use word boundaries to match exact words and prevent substring matches
-            pattern = re.compile(r'\b' + re.escape(word) + r'\b', re.IGNORECASE)
-            # If the word is an exact match and not part of any irrelevant phrase, it's relevant
-            return pattern.search(text) and not contains_irrelevant(irrelevant_phrases, text)
-
-        # Extract relevant keywords and their positions, using word boundaries to avoid partial matches
-        for keyword in self.keywords:
-            for match in re.finditer(r'\b' + re.escape(keyword) + r'\b', text, re.IGNORECASE):
-                start, end = match.start(), match.end()
-                # Check for nearby irrelevant content within a defined window
-                if not contains_irrelevant(self.irrelevant_for_keywords, text[max(0, start - relevant_window): end + relevant_window]):
-                    found_keywords.append((keyword, start, end))
-
-        # Calculate relevant score based on unique keyword positions
-        processed_positions = set()
-        for keyword, start, end in found_keywords:
-            # Only count keywords that are not overlapping with already processed positions
-            if not any(pos in processed_positions for pos in range(start, end)):
-                # Assign weights dynamically based on keyword length or type
-                keyword_weight = len(keyword.split())  # Example: Longer phrases have more weight
-                score += keyword_weight
-                processed_positions.update(range(start, end))
-
-        # Extract anti-keywords and their positions
-        for anti_keyword in self.anti_keywords:
-            for match in re.finditer(r'\b' + re.escape(anti_keyword) + r'\b', text, re.IGNORECASE):
-                start, end = match.start(), match.end()
-                # Check for nearby relevant content within a defined window
-                if not contains_irrelevant(self.irrelevant_for_anti_keywords, text[max(0, start - relevant_window): end + relevant_window]):
-                    found_anti_keywords.append((anti_keyword, start, end))
-
-        # Calculate anti-relevant score based on unique anti-keyword positions
-        processed_anti_positions = set()
-        for anti_keyword, start, end in found_anti_keywords:
-            # Avoid counting anti-keywords that overlap with processed relevant keywords
-            if not any(pos in processed_positions for pos in range(start, end)):
-                # Assign weights dynamically to anti-keywords, possibly lower than for relevant keywords
-                anti_score += 1  # Simple weight for anti-keywords
-                processed_anti_positions.update(range(start, end))
-
-        # Calculate the final score and adjust based on the presence of both relevant and irrelevant keywords
-        final_score = score - anti_score
-
-        # Return the final score and a list of found relevant keywords for reporting
-        return final_score, list(set([kw for kw, _, _ in found_keywords])), list(set([kw for kw, _, _ in found_anti_keywords]))
-
-    def extract_metadata(self, bs):
-        """Extract metadata from a BeautifulSoup object using OpenGraph, Twitter Cards, JSON-LD, Dublin Core, and other tags."""
-        metadata = {
-            "type_page": None,
-            "description": None,
-            "headline": None,
-            "datePublished": None,
-            "dateModified": None,
-            "author": [],
-            "keywords": [],
-            "robots": None,
-        }
-        
-        try:
-            # OpenGraph metadata
-            og_type = bs.find("meta", property="og:type")
-            if og_type:
-                metadata["type_page"] = og_type["content"]
-            og_description = bs.find("meta", property="og:description")
-            if og_description:
-                metadata["description"] = og_description["content"]
-            og_title = bs.find("meta", property="og:title")
-            if og_title:
-                metadata["headline"] = og_title["content"]
-            og_date = bs.find("meta", property="article:published_time")
-            if og_date:
-                metadata["datePublished"] = og_date["content"]
-    
-            # Twitter Card metadata
-            twitter_title = bs.find("meta", attrs={"name": "twitter:title"})
-            if twitter_title:
-                metadata["headline"] = twitter_title["content"]
-            twitter_description = bs.find("meta", attrs={"name": "twitter:description"})
-            if twitter_description:
-                metadata["description"] = twitter_description["content"]
-            twitter_creator = bs.find("meta", attrs={"name": "twitter:creator"})
-            if twitter_creator:
-                metadata["author"].append({"name": twitter_creator["content"]})
-    
-            # JSON-LD metadata: Find all JSON-LD scripts
-            json_ld_scripts = bs.find_all("script", type="application/ld+json")
-            for json_ld_script in json_ld_scripts:
-                try:
-                    json_ld_data = json.loads(json_ld_script.string)
-                    # Handle cases where the JSON-LD is a list of objects
-                    if isinstance(json_ld_data, list):
-                        for item in json_ld_data:
-                            self._merge_json_ld_metadata(metadata, item)
-                    else:
-                        self._merge_json_ld_metadata(metadata, json_ld_data)
-    
-                except json.JSONDecodeError as e:
-                    logger.error(f"Error parsing JSON-LD metadata: {e}")
-    
-            # Standard HTML Meta Tags
-            meta_description = bs.find("meta", attrs={"name": "description"})
-            if meta_description:
-                metadata["description"] = meta_description["content"]
-            meta_author = bs.find("meta", attrs={"name": "author"})
-            if meta_author:
-                metadata["author"].append({"name": meta_author["content"]})
-            meta_keywords = bs.find("meta", attrs={"name": "keywords"})
-            if meta_keywords:
-                metadata["keywords"] = meta_keywords["content"].split(",")
-            meta_robots = bs.find("meta", attrs={"name": "robots"})
-            if meta_robots:
-                metadata["robots"] = meta_robots["content"]
-    
-            # Dublin Core Metadata
-            dc_title = bs.find("meta", attrs={"name": "DC.title"})
-            if dc_title:
-                metadata["headline"] = dc_title["content"]
-            dc_creator = bs.find("meta", attrs={"name": "DC.creator"})
-            if dc_creator:
-                metadata["author"].append({"name": dc_creator["content"]})
-            dc_description = bs.find("meta", attrs={"name": "DC.description"})
-            if dc_description:
-                metadata["description"] = dc_description["content"]
-    
-            # Schema.org Microdata (if present)
-            microdata_title = bs.find(attrs={"itemprop": "name"})
-            if microdata_title:
-                metadata["headline"] = microdata_title.get_text()
-            microdata_description = bs.find(attrs={"itemprop": "description"})
-            if microdata_description:
-                metadata["description"] = microdata_description.get_text()
-            microdata_author = bs.find(attrs={"itemprop": "author"})
-            if microdata_author:
-                metadata["author"].append({"name": microdata_author.get_text()})
-    
-            # RSS/Atom Feeds
-            rss_feed = bs.find("link", attrs={"type": "application/rss+xml"})
-            if rss_feed:
-                metadata["rss_feed"] = rss_feed["href"]
-            atom_feed = bs.find("link", attrs={"type": "application/atom+xml"})
-            if atom_feed:
-                metadata["atom_feed"] = atom_feed["href"]
-            
-        except Exception as e:
-            logger.error(f"Error extracting metadata: {e}")
-        
-        return metadata
-    
-    
-    def _merge_json_ld_metadata(self, metadata, json_ld_data):
-        """Helper function to merge JSON-LD data into the existing metadata dictionary."""
-        if "@type" in json_ld_data and not metadata["type_page"]:
-            metadata["type_page"] = json_ld_data["@type"]
-        if "headline" in json_ld_data and not metadata["headline"]:
-            metadata["headline"] = json_ld_data["headline"]
-        if "description" in json_ld_data and not metadata["description"]:
-            metadata["description"] = json_ld_data.get("description")
-        if "datePublished" in json_ld_data and not metadata["datePublished"]:
-            metadata["datePublished"] = json_ld_data["datePublished"]
-        if "dateModified" in json_ld_data and not metadata["dateModified"]:
-            metadata["dateModified"] = json_ld_data.get("dateModified")
-        if "author" in json_ld_data:
-            if isinstance(json_ld_data["author"], dict):
-                metadata["author"].append({"name": json_ld_data["author"].get("name")})
-            elif isinstance(json_ld_data["author"], list):
-                for author in json_ld_data["author"]:
-                    metadata["author"].append({"name": author.get("name")})
-
-    def clean_text(self, text):
-        """Clean input text by removing extra newlines, spaces, URLs, and unwanted characters."""
-        # Remove URLs
-        # Remove non-alphanumeric characters except spaces
-        text = re.sub(r"[^a-zA-Z0-9\s]", "", text)
-        # Remove multiple newlines and replace them with a single newline
-        text = re.sub(r"\n+", "\n", text)
-        # Replace multiple spaces with a single space
-        text = re.sub(r"\s+", " ", text)
-        # Trim leading and trailing spaces
-        text = text.strip()
-        return text
-
-    def is_valid_phrase(self, phrase):
-        """
-        Check if a given phrase is valid for keyword extraction.
-        This method filters out phrases that are purely numeric, too short,
-        or consist of only stopwords or symbols.
-
-        Args:
-            phrase (str): The phrase to be validated.
-
-        Returns:
-            bool: True if the phrase is valid, False otherwise.
-        """
-        # Check if the phrase is empty or None
-        if not phrase or not phrase.strip():
-            return False
-
-        # Check if the phrase contains only digits or symbols
-        if phrase.isdigit() or not any(char.isalpha() for char in phrase):
-            return False
-
-        # Tokenize the phrase and check against stopwords
-        tokens = phrase.split()
-        if len(tokens) == 0:
-            return False
-
-        # Minimum length check (e.g., at least 3 characters)
-        if len(phrase) < 3:
-            return False
-
-        # Ensure the phrase has meaningful content (not just a single common word)
-        # if all(token.lower() in self.stopwords for token in tokens):
-        #     return False
-
-        return True
-
-    def filter_similar_keywords(self, keywords, threshold=0.8):
-        try:
-            """Filter out semantically similar keywords to keep only the most relevant."""
-            # Calculate TF-IDF vector for all keywords
-            vectorizer = TfidfVectorizer().fit_transform([kw["text"] for kw in keywords])
-            vectors = vectorizer.toarray()
-            # Compute cosine similarity matrix
-            cosine_matrix = cosine_similarity(vectors)
-            # Initialize a set to keep unique keywords
-            unique_keywords = []
-            for i, kw in enumerate(keywords):
-                # Check if this keyword is not too similar to any selected unique keyword
-                if all(
-                    cosine_matrix[i][j] < threshold
-                    for j in range(i)
-                    if keywords[j] in unique_keywords
-                ):
-                    unique_keywords.append(kw)
-            return unique_keywords
-        except:
-            return []
-
-    def extract_key_phrases(
-        self,
-        text,
-        max_phrases=40,
-        min_score=0.5,
-        min_phrases=5,
-        similarity_threshold=0.8):
-        """Extract key phrases with advanced filtering for concise and accurate output, including NER and overlapping management."""
-
-        logger.info("Starting key phrase extraction.")
-
-        # Clean the input text
-        cleaned_text = self.clean_text(text)
-        logger.debug(f"Cleaned text for keyword extraction: {cleaned_text[:100]}...")
-
-        # Extract keywords using YAKE, BERT, and NER
-        logger.info("Extracting keywords using YAKE, BERT, and NER models.")
-        yake_extractor = yake.KeywordExtractor(
-            lan="en", n=3, dedupLim=0.9, top=max_phrases, features=None
-        )
-        yake_keywords = yake_extractor.extract_keywords(cleaned_text)
-        logger.debug(f"Extracted YAKE keywords: {yake_keywords}")
-
-        bert_keywords = self.kw_model.extract_keywords(
-            cleaned_text, keyphrase_ngram_range=(1, 3), stop_words="english"
-        )
-        logger.debug(f"Extracted BERT keywords: {bert_keywords}")
-
-        ner_keywords = self.extract_entities(cleaned_text)  # Returns list of tuples [(text, type), ...]
-        logger.debug(f"Extracted NER keywords: {ner_keywords}")
-
-        # Combined keywords with faster lookup using a dictionary
-        combined_keywords = {}
-        existing_keywords_set = set(self.keywords)
-        logger.info("Combining extracted keywords from YAKE, BERT, and NER.")
-
-        # Process YAKE, BERT, and NER keywords in a single loop
-        for kw_list, source_tag, default_score in [
-            (yake_keywords, "yake", None),
-            (bert_keywords, "bert", None),
-            (ner_keywords, "ner", 1.0),
-        ]:
-            for item in kw_list:
-                # Handle NER keywords separately
-                if source_tag == "ner":
-                    kw, entity_type = item
-                    score = 1.0
-                    tag = "ner"
-                else:
-                    kw, score = item
-                    entity_type = None
-                    tag = source_tag
-
-                # Check if the phrase is valid (not just numbers or symbols) and is a noun phrase
-                if not self.is_valid_phrase(kw):
-                    logger.debug(f"Invalid phrase skipped: {kw}")
-                    continue
-
-                # If the keyword passes the score filter or is an existing keyword
-                if score >= min_score or kw in existing_keywords_set:
-                    if kw in combined_keywords:
-                        # Update existing keyword's score and tags only if the tag is not already added
-                        if combined_keywords[kw]["tag"] == "ner":
-                            combined_keywords[kw]["score"] = combined_keywords[kw]["score"]
+                        if response.status == 200:
+                            try:
+                                content_bytes = await response.read()
+                                result = chardet.detect(content_bytes)
+                                encoding = result['encoding'] or 'utf-8'
+                                text = content_bytes.decode(encoding, errors='replace')
+                                text = self._apply_after_fetch_plugins(url, text)
+                                return text, mime, response.status
+                            except Exception as e:
+                                logger.error(
+                                    f"Error decoding response from {url}: {e}"
+                                )
+                                return None, mime, response.status
+                        elif response.status == 404:
+                            logger.warning(f"URL not found (404): {url}")
+                            await self.urls_to_visit.mark_seen(url)
+                            text = await response.text()
+                            return text, mime, response.status
                         else:
-                            combined_keywords[kw]["score"] = max(combined_keywords[kw]["score"], score)
-                        if tag not in combined_keywords[kw]["tag"]:
-                            combined_keywords[kw]["tag"] += f", {tag}"
-                        if entity_type:  # Update type if it's an NER keyword
-                            combined_keywords[kw]["type"] = entity_type
-                        # Increment the count for existing keywords
-                        combined_keywords[kw]["count"] += 1
-                        logger.debug(f"Updated existing keyword: {kw} with new score and tags.")
-                    else:
-                        # Add new keyword with a count of 1
-                        combined_keywords[kw] = {
-                            "text": kw,
-                            "score": score,
-                            "tag": tag,
-                            "type": entity_type,
-                            "count": 1,  # Initialize count
-                        }
-                        logger.debug(f"Added new keyword: {kw} with score: {score} and tag: {tag}.")
+                            logger.warning(
+                                f"Failed to fetch {url}, status code: {response.status}, retry count: {i}"
+                            )
+            except Exception as e:
+                    logger.error(f"Error fetching {url}, attempt {i + 1}/5: {e}")
 
-        # Convert dictionary to sorted list of dictionaries
-        sorted_combined_keywords = sorted(
-            combined_keywords.values(), key=lambda x: x["score"], reverse=True
-        )
-        logger.info(f"Sorted combined keywords by score. Total keywords: {len(sorted_combined_keywords)}.")
+        logger.error(f"Max retries reached for {url}, will reattempt later")
+        return None, mime, None
 
-        # Filter similar keywords to remove redundancy using Sentence-BERT
-        sorted_combined_keywords = self.filter_similar_keywords(
-            sorted_combined_keywords, similarity_threshold
-        )
-        logger.info(f"Filtered similar keywords using similarity threshold of {similarity_threshold}.")
-
-        # Ensure all existing keywords are included, regardless of max_phrases
-        final_keywords_dict = {kw["text"]: kw for kw in sorted_combined_keywords}
-        logger.info(f"Final key phrases extracted. Total unique key phrases: {len(final_keywords_dict)}.")
-
-        return final_keywords_dict
-
-
-    def extract_entities(self, text):
-        """Extract named entities using spaCy."""
-        doc = self.nlp(text)
-        entities = [(ent.text, ent.label_) for ent in doc.ents]
-        return entities
-
-    def update_graph_node(self, url, score, found_keywords):
-        """Update the graph node with new score and keywords found."""
-        # if url in self.graph:
-        #     self.graph.nodes[url]["score"] = score
-        #     self.graph.nodes[url]["keywords"] = found_keywords
-        pass
-
-    async def _process_feed(self, session, url):
-        """Process RSS feed URLs in a separate thread."""
-        logger.info(f"Processing RSS feed URL: {url}")
-        text = await self._fetch(session, url)
-
-        # Define the blocking work to be done in a thread
-        def process_feed_content(text, url):
+    async def _process_feed(self, text, url):
+        """Process RSS feed URLs."""
+        logger.info(f"Processing feed URL: {url}")
+        try:
+            for plugin in self.plugins:
+                plugin.before_process_feed(url, text, self)
             if text:
-                logger.debug(f"Fetched content for RSS feed URL: {url}, parsing entries.")
                 feed = feedparser.parse(text)
                 for entry in feed.entries:
                     link = entry.link
-                    if self._is_allowed_domain(self._normalize_url(link)):
-                        priority, _, _ = self.relative_score(entry.title)
-                        self._add_to_queue(link, "webpage", priority=priority, from_page=url)
-                        logger.info(f"Added feed entry URL: {link} to the queue with priority: {priority}")
+                    score, found_keywords, _ = kw_finder.relative_keywords_score(
+                        entry.title
+                    )
+                    await self._add_to_queue(link, "webpage", priority=score)
             else:
-                logger.warning(f"Failed to fetch RSS feed content for URL: {url}")
+                logger.warning(f"Failed to fetch feed content for URL: {url}")
+        except Exception as e:
+            logger.error(f"Error processing feed {url}: {e}")
 
-        # If text is available, process it in a thread
-        if text:
-            await asyncio.to_thread(process_feed_content, text, url)
+    def should_crawl(self, bs, headers=None):
+        """
+        Determine whether to crawl a page based on its meta robots tags and X-Robots-Tag header.
+        """
+        logger.debug(
+            "Checking if page should be crawled based on meta robots tags and headers."
+        )
+        index_allowed = True  # Assume we can index unless specified otherwise
+        follow_allowed = True  # Assume we can follow unless specified otherwise
 
-        
-    async def _process_sitemap(self, session, url):
-        """Process sitemap XML URLs."""
-        logger.info(f"Processing sitemap URL: {url}")
-        text = await self._fetch(session, url)
+        # Check for the meta robots tag
+        robots_meta = bs.find("meta", attrs={"name": "robots"})
+        if robots_meta:
+            content = robots_meta.get("content", "").lower()
+            if "noindex" in content:
+                index_allowed = False  # No indexing is allowed
+            if "nofollow" in content:
+                follow_allowed = False  # No following is allowed
 
-        # Define the blocking work to be done in a thread
-        def do_work_thread_sitemap(text, url):
-            """Process the fetched XML text in a separate thread."""
-            if text:
-                logger.debug(f"Fetched content for sitemap URL: {url}, parsing for links.")
-                bs = BeautifulSoup(text, "xml")
-                for loc in bs.find_all("loc"):
-                    self._add_to_queue(loc.text, "webpage", priority=0, from_page=url)
-                    logger.info(f"Added sitemap URL: {loc.text} to the queue as webpage.")
-                for sitemap in bs.find_all("sitemap"):
-                    self._add_to_queue(sitemap.text, "sitemap", priority=0, from_page=url)
-                    logger.info(f"Added sitemap URL: {sitemap.text} to the queue as sitemap.")
-            else:
-                logger.warning(f"Failed to fetch sitemap content for URL: {url}")
+        # Check for X-Robots-Tag HTTP header
+        if headers is not None:
+            x_robots_tag = headers.get("X-Robots-Tag", "").lower()
+            if "noindex" in x_robots_tag:
+                index_allowed = False  # No indexing is allowed
+            if "nofollow" in x_robots_tag:
+                follow_allowed = False  # No following is allowed
 
-        if text:
-            # Create a thread pool executor to run do_work_thread in a separate thread
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                # Submit the task to the executor
-                future = executor.submit(do_work_thread_sitemap, text, url)
-                # Optionally, wait for the result if needed
-                await future
-    
-    async def crawl(self):
-        """Start the crawling process."""
-        print("Start the crawling process")
-        batch_size = 50
-        self.semaphore = asyncio.Semaphore(1)
-        tasks = []  # List to hold all asynchronous tasks
-        async with aiohttp.ClientSession() as session:
-            while not self.urls_to_visit.empty():
-                logger.info(f"Processing batch of up to {batch_size} URLs")
-                for i in range(batch_size):
-                    if self.urls_to_visit.empty():
-                        break
-                    # Get the next URL to process
-                    url_item = self.urls_to_visit.pop()
-                    print(url_item)
-                    # Check robots.txt rules
-                    o = urlparse(url_item.url)
-                    if o.hostname in self.rob and not self.rob[o.hostname].can_fetch("*", url_item.url):
-                        logger.warning(f"Blocked by robots.txt: {url_item.url}")
-                        continue
-                    # Skip if URL is already seen
-                    if url_item.url in self.seen_urls:
-                        logger.debug(f"Already seen URL: {url_item.url}")
-                        continue
-                    self.seen_urls.add(url_item.url)
-                    # Depending on URL type, choose processing function
-                    if url_item.url_type == "feed":
-                        task = self._process_feed(session, url_item.url)
-                    elif url_item.url_type == "sitemap":
-                        task = self._process_sitemap(session, url_item.url)
+        # Final decision: If following is allowed, we can crawl regardless of indexing
+        return follow_allowed or index_allowed
+
+    def is_spider_trap(self, url):
+        """Detect if a URL is likely a spider trap."""
+        return False
+
+    async def _process_sitemap(self, text, url):
+        """Process Sitemap, RSS, or Atom feed content from a URL."""
+        if not text:
+            await self.urls_to_visit.mark_seen(url)
+            logger.warning(f"Failed to fetch content for URL: {url}")
+            return
+
+        # Try to parse the content as an RSS or Atom feed
+        feed = feedparser.parse(text)
+
+        if feed.bozo == 0 and feed.entries:
+            # It's an RSS or Atom feed
+            logger.info(f"Detected RSS/Atom feed at {url}")
+            for entry in feed.entries:
+                link = entry.link
+                score, found_keywords, _ = kw_finder.relative_keywords_score(
+                    entry.title
+                )
+                self._add_to_queue(link, "webpage", priority=score)
+                logger.info(
+                    f"Added feed entry URL: {link} to the queue with priority {score}"
+                )
+        else:
+            # Try to parse the content as a sitemap
+            bs = BeautifulSoup(text, "lxml")  # Use lxml parser for speed
+            sitemap_urls = bs.find_all("loc")
+            if sitemap_urls:
+                # It's a sitemap
+                logger.info(f"Detected Sitemap at {url}")
+                for loc in sitemap_urls:
+                    link = loc.text
+
+                    # Check if the link is a sitemap based on its extension
+                    if link.endswith(".xml"):
+                        self._add_to_queue(link, "sitemap", priority=0)
+                        logger.info(f"Added sitemap URL: {link} to the queue as sitemap.")
                     else:
-                        task = self._process_url(session, url_item.url)
-                    tasks.append(task)  # Add the task to the list
-                # Wait for tasks to complete in batches
-                logger.info(f"Executing batch of {len(tasks)} tasks")
-                await asyncio.gather(*tasks)
-                tasks.clear()  # Clear tasks for the next batch
-                # self.workout_new_keyphrases()
-                
-                self.processed_urls_count += batch_size
-                # Save checkpoint periodically
-                if self.processed_urls_count >= self.checkpoint_interval:
-                    self._save_checkpoint()
-                    self.processed_urls_count = 0  # Reset the counter after saving
-            # After all URLs are processed
-            self._save_checkpoint()
+                        self._add_to_queue(link, "webpage", priority=0)
+                        logger.info(f"Added URL: {link} to the queue as webpage.")
+            else:
+                logger.warning(
+                    f"Unable to parse content at {url} as RSS/Atom feed or Sitemap."
+                )
+                await self.urls_to_visit.mark_seen(url)
 
+    def extract_metadata(self, html_content, url):
+        """Extract metadata from HTML content using BeautifulSoup."""
+        try:
+            bs = BeautifulSoup(html_content, "lxml")  # Use lxml parser
 
-# from bbc_scripe_cdx import get_all_urls
-from ovarit import ovarit_domain_scrape
-import utils.keywords as kw
+            # Process microdata using BeautifulSoup
+            metadata = self.process_microdata_bs(bs)
 
+            # If microdata is empty, try to extract JSON-LD
+            if not metadata:
+                metadata = self.process_json_ld_bs(bs)
 
-async def main():
-    # Define the input configuration
-    main_url = [
-        "https://www.bbc.co.uk",
-        "https://feeds.bbci.co.uk/",
-        "https://www.bbc.co.uk/newsround/",
-    ]
-    allowed_subdirs = [
-        "www.bbc.co.uk/news/",
-        "www.bbc.co.uk/sport/",
-        "www.bbc.co.uk/newsround/",
-    ]
-    # Define keywords and anti-keywords
-    keywords = kw.Little_List  # Replace with your actual keyword list
-    anti_keywords = []  # Define any anti-keywords if needed
-    feeds = [
-        "http://feeds.bbci.co.uk/news/rss.xml",
-        "http://feeds.bbci.co.uk/news/world/rss.xml",
-        "http://feeds.bbci.co.uk/news/business/rss.xml",
-        "http://feeds.bbci.co.uk/news/politics/rss.xml",
-        "http://feeds.bbci.co.uk/news/education/rss.xml",
-        "http://feeds.bbci.co.uk/news/science_and_environment/rss.xml",
-        "http://feeds.bbci.co.uk/news/technology/rss.xml",
-        "http://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml",
-    ]
-    # Initialize the crawler with the corrected parameters
-    crawler = KeyPhraseFocusCrawler(
-        start_urls=main_url,
-        keywords=keywords,
-        anti_keywords=anti_keywords,
-        allowed_subdirs=allowed_subdirs,
-        feeds=feeds,
-        irrelevant_for_keywords=kw.irrelevant_for_keywords
-    )
-    await crawler.crawl()
+            # If still no metadata, fallback to standard meta tags
+            if not metadata:
+                metadata = self.process_standard_meta(bs)
 
+            if not metadata:
+                page_time = bs.find("time", attrs={"datetime": True})
+                if page_time:
+                    metadata["last-modified"] = page_time["datetime"]
+                    metadata["datePublished"] = page_time["datetime"]
 
-# Run the main function
-if __name__ == "__main__":
-    asyncio.run(main())
+            return metadata
+        except Exception as e:
+            logger.exception(f"Failed to extract metadata from {url}: {e}")
+            return {}
+
+    def process_microdata_bs(self, bs):
+        """Process and normalize Microdata using BeautifulSoup."""
+        metadata = {}
+        # Find all items with itemscope but no itemprop (top-level items)
+        items = bs.find_all(attrs={"itemscope": True, "itemprop": False})
+        for item in items:
+            item_type = item.get("itemtype", "")
+            # Normalize the item type
+            if item_type.startswith("http"):
+                item_type = item_type.split("/")[-1]
+
+            if item_type in ["NewsArticle", "Article"]:
+                properties = self.extract_microdata_properties(item)
+
+                # Map the properties to the metadata dictionary
+                metadata["@type"] = item_type
+                metadata["headline"] = properties.get("headline", "")
+                metadata["datePublished"] = properties.get("datePublished", "")
+                metadata["dateModified"] = properties.get("dateModified", "")
+                metadata["image"] = properties.get("image", "")
+                metadata["description"] = properties.get("description", "")
+
+                # Handle authors
+                author_items = item.find_all(
+                    attrs={"itemprop": "author", "itemscope": True}
+                )
+                authors = []
+                for author_item in author_items:
+                    author_props = self.extract_microdata_properties(author_item)
+                    authors.append(
+                        {
+                            "name": author_props.get("name", ""),
+                            "url": author_props.get("url", ""),
+                            "sameAs": author_props.get("sameAs", ""),
+                        }
+                    )
+                if authors:
+                    metadata["author"] = authors
+        return metadata
+
+    def extract_microdata_properties(self, item):
+        """Extract properties from a microdata item."""
+        properties = {}
+        # Find all direct children with itemprop
+        props = item.find_all(attrs={"itemprop": True}, recursive=False)
+        for prop in props:
+            prop_name = prop.get("itemprop", "")
+            # Check if the property is another nested item
+            if prop.has_attr("itemscope"):
+                prop_value = self.extract_microdata_properties(prop)
+            else:
+                prop_value = prop.get("content") or prop.get_text(strip=True)
+            properties[prop_name] = prop_value
+        return properties
+
+    def process_json_ld_bs(self, bs):
+        """Process and normalize JSON-LD using BeautifulSoup."""
+        metadata = {}
+        scripts = bs.find_all("script", type="application/ld+json")
+        for script in scripts:
+            try:
+                json_content = script.string
+                data = json.loads(json_content)
+                # Handle cases where data is a list
+                if isinstance(data, list):
+                    for item in data:
+                        self._process_json_ld_item(item, metadata)
+                else:
+                    self._process_json_ld_item(data, metadata)
+            except json.JSONDecodeError as e:
+                logger.warning(f"JSON decoding failed: {e}")
+        return metadata
+
+    def _process_json_ld_item(self, item, metadata):
+        """Helper function to process individual JSON-LD items."""
+        if item.get("@type") == "NewsArticle" or item.get("@type") == "Article":
+            metadata["@type"] = item.get("@type")
+            metadata["headline"] = item.get("headline")
+            metadata["datePublished"] = item.get("datePublished")
+            metadata["dateModified"] = item.get("dateModified")
+            metadata["image"] = item.get("image")
+            metadata["description"] = item.get("description")
+
+            # Handle multiple authors
+            if "author" in item:
+                authors = []
+                author_data = item.get("author")
+                if isinstance(author_data, dict):
+                    author_data = [author_data]
+                for author in author_data:
+                    authors.append(
+                        {
+                            "name": author.get("name"),
+                            "url": author.get("url"),
+                            "sameAs": author.get("sameAs"),
+                            "honorificPrefix": author.get("honorificPrefix"),
+                            "jobTitle": author.get("jobTitle"),
+                        }
+                    )
+                metadata["author"] = authors
+
+    def process_standard_meta(self, bs):
+        """Fallback method to extract standard meta tags."""
+        metadata = {}
+
+        # Extract title
+        title = bs.find("title")
+        if title:
+            metadata["headline"] = title.get_text(strip=True)
+
+        # Extract description
+        description = bs.find("meta", attrs={"name": "description"})
+        if description:
+            metadata["description"] = description.get("content")
+
+        # Extract author
+        author = bs.find("meta", attrs={"name": "author"})
+        if author:
+            metadata["author"] = [{"name": author.get("content")}]
+
+        # Extract datePublished
+        date_published = bs.find("meta", attrs={"name": "datePublished"})
+        if date_published:
+            metadata["datePublished"] = date_published.get("content")
+
+        # You can add more meta tags as needed
+
+        return metadata
+
+    def write_to_csv(self, url, score, found_keywords, word_mached, metadata):
+        """Write the extracted data to a CSV file."""
+        try:
+            # Updated fieldnames to match the required headers
+            # Format the author field
+            authors = metadata.get("author", "")
+            if isinstance(authors, list):
+                authors_str = ", ".join(
+                    [a.get("name", "") for a in authors if a.get("name")]
+                )
+            elif isinstance(authors, str):
+                authors_str = authors
+            else:
+                authors_str = ""
+
+            # Create the row with the necessary metadata fields
+            row = [
+                url,
+                score,
+                ", ".join(found_keywords),
+                metadata.get("headline", ""),
+                metadata.get("datePublished", ""),
+                authors_str,
+                metadata.get("byline", ""),
+            ]
+
+            self.csv_writer.writerow(row)
+            logger.debug(f"Data written to CSV for {url}")
+        except Exception as e:
+            logger.error(f"Failed to write to CSV for {url}: {e}")
+            traceback.print_exc()
+
+    async def extract_and_queue_links(self, bs, url, score):
+        """Extract and queue new links from the page content."""
+        try:
+            links = bs.find_all("a", href=True)
+            for link in links:
+                href = link["href"]
+                rel = link.get("rel", "")
+                anchor_text = link.get_text()
+                if href.startswith("/"):
+                    href = urljoin(url, href)
+
+                final_score = score
+                if anchor_text and isinstance(anchor_text, str) and len(anchor_text):
+                    temp_score, _, _ = kw_finder.relative_keywords_score(anchor_text)
+                    final_score = max(final_score, temp_score)
+
+                # Ensure that score is an integer
+                final_score = ensure_int(final_score)
+
+                await self._add_to_queue(href, "webpage", priority=final_score)
+                if "canonical" in rel:
+                    await self.urls_to_visit.mark_seen(href)
+                logger.debug(f"Queued link {href} with score {final_score}")
+        except Exception as e:
+            logger.error(f"Failed to extract links from {url}: {e}")
+
+    def _parse_date(self, date_str):
+        """Convert a date string to a datetime object."""
+        try:
+            # Handle different date formats (this example assumes ISO format)
+            return datetime.datetime.fromisoformat(date_str)
+        except ValueError as e:
+            logger.error(f"Error parsing date string '{date_str}': {e}")
+            return None
+
+    async def _analyze_page_content(self, text, url):
+        """Analyze and process webpage content."""
+        try:
+            bs = BeautifulSoup(text, "lxml")  # Use lxml parser
+
+            logger.debug("BeautifulSoup parser initialized.")
+
+            # Process the article using the processArticle module
+            excerpt, siteName, lang, byline, tlite, content = (
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            try:
+                if processArticle:
+                    article = processArticle.ProcessArticle(text, url)
+                    if article:
+                        excerpt = article.excerpt
+                        siteName = article.siteName
+                        lang = article.lang
+                        byline = article.byline
+                        tlite = article.title
+                        content = article.content
+            except Exception as e:
+                logger.error(f"ProcessArticle failed for {url}: {e}")
+                logger.debug(f"Continuing without ProcessArticle for {url}")
+
+            # Backup metadata extraction if ProcessArticle fails
+            if not content:
+                article = simple_json_from_html_string(text)
+                if article:
+                    byline = article.get("byline", "No author found")
+                    tlite = article.get("title", "No title found")
+                    content = (
+                        BeautifulSoup(str(article.get("content")), "lxml").get_text(
+                            separator=" "
+                        )
+                        if article.get("content")
+                        else None
+                    )
+
+            if not content:
+                logger.debug("Attempting fallback metadata extraction.")
+                content = bs.get_text(separator=" ")
+                excerpt_tag = bs.find("meta", {"name": "description"}) or bs.find("p")
+                if excerpt_tag:
+                    excerpt = excerpt_tag.get_text(strip=True)[:255]
+
+                # Fallback methods to get title, site name, etc.
+                tlite = bs.title.string if bs.title else "No title found"
+                siteName_tag = bs.find("meta", property="og:site_name")
+                siteName = siteName_tag["content"] if siteName_tag else "Unknown site"
+                lang = bs.find("html").get("lang") if bs.find("html") else "Unknown language"
+                byline_tag = bs.find("meta", attrs={"name": "author"})
+                byline = byline_tag["content"] if byline_tag else "No author found"
+
+            # Remove unwanted elements
+            unwanted_tags = [
+                "script",
+                "style",
+                "footer",
+                "header",
+                "aside",
+                "nav",
+                "noscript",
+                "form",
+                "iframe",
+                "button",
+            ]
+            unwanted_classes_ids = [
+                "ads",
+                "sponsored",
+                "social",
+                "share",
+                "comment",
+                "comments",
+                "related",
+                "subscription",
+                "sidebar",
+            ]
+
+            for tag in unwanted_tags:
+                for element in bs.find_all(tag):
+                    element.extract()
+
+            for class_id in unwanted_classes_ids:
+                for element in bs.find_all(True, {"class": class_id}):
+                    element.extract()
+                for element in bs.find_all(True, {"id": class_id}):
+                    element.extract()
+
+            # Remove hidden content (based on CSS or classes)
+            hidden_classes = ["hidden", "hide", "sr-only", "visually-hidden"]
+            for hidden in bs.find_all(class_=hidden_classes):
+                hidden.extract()
+
+            # Use heuristic to find the most meaningful content
+            article_content = bs.find("article")
+            if not article_content:
+                article_content = max(
+                    bs.find_all("div"), key=lambda x: len(x.get_text()), default=bs
+                )
+
+            content = article_content.get_text(separator=" ")
+            # Further clean the content
+            content = content.encode("ascii", "ignore").decode()
+            content = re.sub(r"\s+", " ", content).strip()
+            word_mached = []
+            score, found_keywords, _ = kw_finder.relative_keywords_score(content)
+            await self.extract_and_queue_links(bs, url, score)
+            for exclude_subdirs_scrape in self.exclude_subdirs_scrape:
+                if exclude_subdirs_scrape in url:
+                    await self.urls_to_visit.mark_seen(url)
+                    return
+
+            await self.urls_to_visit.set_page_score_page(url, score)
+
+            if score > 0:
+                metadata = self.extract_metadata(text, url)
+
+                # Add metadata fields to the extracted data
+                metadata.update(
+                    {
+                        "excerpt": excerpt,
+                        "siteName": siteName,
+                        "lang": lang,
+                        "byline": byline,
+                        "tlite": tlite,
+                        "type_page": "webpage",
+                    }
+                )
+                if (
+                    self.start_data
+                    and self.end_data
+                    and metadata.get("datePublished")
+                ):
+                    datePublished = self._parse_date(metadata.get("datePublished"))
+                    if datePublished and (
+                        datePublished <= self.start_data
+                        or datePublished >= self.end_data
+                    ):
+                        await self.urls_to_visit.mark_seen(url)
+                if (
+                    self.exclude_lag
+                    and lang
+                    and metadata.get("lang") in self.exclude_lag
+                ):
+                    await self.urls_to_visit.mark_processing(url)
+                    logger.info(
+                        f"Skipping URL due to language mismatch: {url} (lang: {lang})"
+                    )
+                    return  # Skip further processing if language is in exclude_lag
+                self.write_to_csv(url, score, found_keywords, word_mached, metadata)
+
+        except Exception as e:
+            logger.error(f"Error parsing content from {url}: {e}")
+            logger.debug(f"Exception details: {traceback.format_exc()}")
+            exc_type, exc_obj, exc_tb = sys.exc_info()
+            fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
+            logger.error(
+                f"Exception type: {exc_type}, File: {fname}, Line: {exc_tb.tb_lineno}"
+            )
+
+        await self.urls_to_visit.mark_seen(url)
+
+    async def _process_url(self, text, url):
+        """Fetch and process a webpage."""
+        if text is not None:
+            text = self._apply_after_fetch_plugins(url, text)
+            await self._analyze_page_content(text, url)
+        if text is None or not text.strip():
+            logger.error(f"Empty or None response for URL: {url}")
+            return
+
+    async def route_based_on_mime(self, url, mime, text, url_item):
+        """Route processing based on the MIME type."""
+        try:
+            if "feed.rss" in url_item.url:
+                return await self._process_feed(text, url)
+            if "feed.atom" in url_item.url:
+                return await self._process_feed(text, url)
+            elif url_item.page_type == "feed":
+                return await self._process_feed(text, url)
+            elif url_item.page_type == "sitemap":
+                return await self._process_sitemap(text, url)
+            mime_type_mapping = {
+                "text/html": self._process_url,
+                "application/rss+xml": self._process_feed,
+                "application/xml": self._process_sitemap,
+                "text/xml": self._process_sitemap,
+            }
+            if mime:
+                for mime_prefix, handler in mime_type_mapping.items():
+                    if mime.startswith(mime_prefix):
+                        return await handler(text, url)
+            if url_item.page_type == "webpage":
+                return await self._process_url(text, url)
+            logger.warning(f"Unsupported MIME type: {mime} for URL: {url}")
+            return None
+        except Exception as e:
+            logger.error(f"Error in routing based on MIME: {e}")
+            traceback.print_exc()
+
+    async def crawl_main(self):
+        batch_size = 20  # Increased batch size from 10 to 20
+        conn = aiohttp.TCPConnector(limit_per_host=20, limit=200)  # Increased limits
+        async with aiohttp.ClientSession(connector=conn) as session:
+            max_count = await self.urls_to_visit.count_all()
+
+            # Wrap tqdm around the total count
+            with tqdm.tqdm(
+                total=max_count, desc="Crawling Progress", unit="url"
+            ) as pbar:
+                total_done = await self.urls_to_visit.count_seen()
+                pbar.n = total_done
+                while not (await self.urls_to_visit.empty(self.allow_for_recruiting)):
+                    tasks = []
+                    for _ in range(batch_size):
+                        if (await self.urls_to_visit.empty(self.allow_for_recruiting)):
+                            break
+                        url_item = await self.urls_to_visit.pop(self.allow_for_recruiting)
+                        if not url_item:
+                            break
+
+                        # Check if the URL contains one of the allowed subdirectories
+                        if not (url_item.page_type == "start" or url_item.page_type == "sitemap"):
+                            is_good = False
+                            if not is_good:
+                                for subdir in self.allowed_subdirs_cruel:
+                                    if subdir in url_item.url:
+                                        is_good = True
+                                        break
+                                for subdir in self.exclude_subdirs_cruel:
+                                    if subdir in url_item.url:
+                                        is_good = False
+                                        break
+
+                            if not is_good:
+                                await self.urls_to_visit.mark_seen(url_item.url)
+                                continue  # Skip this URL if it doesn't match the allowed subdirectories
+
+                        await self.urls_to_visit.mark_processing(url_item.url)
+                        if url_item is None or not self.is_valid_url(url_item.url):
+                            logger.error(
+                                f"Invalid or None URL fetched from the queue: {url_item}"
+                            )
+                            continue
+
+                        async def task(url_item, session):
+                            try:
+                                text, mime, status = await self._fetch(session, url_item)
+                                if text:
+                                    # Pass the correct `url_item` object to the routing function
+                                    await self.route_based_on_mime(
+                                        url_item.url, mime, text, url_item
+                                    )
+                                else:
+                                    self.urls_to_visit.push(url_item)
+                            except Exception as e:
+                                logger.error(f"Error processing URL: {url_item.url} {e}")
+                                self.urls_to_visit.push(url_item)
+                            pbar.update(1)  # Update progress bar on task completion
+
+                        tasks.append(asyncio.create_task(task(url_item, session)))
+
+                    max_count = await self.urls_to_visit.count_all()
+                    pbar.total = max_count  # Update total count if it changes
+                    if tasks:
+                        await asyncio.gather(*tasks)
+
+            for plugin in self.plugins:
+                plugin.on_finish(self)
+
+    async def crawl_start(self):
+        
+        db_dir = os.path.dirname(self.file_db)
+        if not os.path.exists(db_dir):
+            os.makedirs(db_dir)
+        self.conn = await aiosqlite.connect(self.file_db)
+        self.robots = RobotsSql(self.conn)
+        self.keyphrases = SQLDictClass(self.conn, table_name="keyphrases")
+        self.urls_to_visit = BackedURLQueue(
+            self.conn, table_name="urls_to_visit"
+        )
+        await self.urls_to_visit.initialize()
+
+        logger.info("Starting crawl_main")
+        self._initialize_output_csv()
+        self._initialize_plugins()
+        await self._initialize_urls(self.start_urls, self.feeds, self.seed_urls)
+        await self.crawl_main()
+        # Close the CSV file and database connection
+        if self.csv_file:
+            self.csv_file.close()
+        await self.conn.close()

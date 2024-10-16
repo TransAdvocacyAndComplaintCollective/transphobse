@@ -1,7 +1,6 @@
 from time import sleep
 from duckduckgo_search import DDGS
 from duckduckgo_search.exceptions import RatelimitException 
-import random
 
 def lookup_duckduckgo(keyword, domain):
     for i in range(10):
@@ -20,7 +19,6 @@ def lookup_duckduckgo(keyword, domain):
     
 
 def lookup_duckduckgos(keywords, domain):
-    random.shuffle(keywords)  # Shuffle keywords for randomness
     for keyword in keywords:
         cout = 0
         for result in lookup_duckduckgo(keyword, domain):

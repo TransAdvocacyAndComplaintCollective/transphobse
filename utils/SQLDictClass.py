@@ -1,214 +1,204 @@
-import sqlite3
-import threading
 import time
 from urllib.robotparser import RobotFileParser
+import aiosqlite
 
 class SQLDictClass:
     def __init__(self, conn, table_name="robot_dict"):
         self.table_name = table_name
         self.conn = conn
-        self.cursor = self.conn.cursor()
-        self.lock = threading.Lock()  # Thread-safe lock
-        self._create_table()
 
-    def _create_table(self):
-        with self.lock:
-            # Create a table to store robots.txt data
-            self.cursor.execute(f'''
-                CREATE TABLE IF NOT EXISTS {self.table_name} (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    last_checked INTEGER,
-                    url TEXT UNIQUE,
-                    host TEXT,
-                    path TEXT,
-                    disallow_all BOOLEAN,
-                    allow_all BOOLEAN,
-                    text TEXT CHECK(length(text) <= 512000)  -- Limit to 500 KiB
-                )
-            ''')
-            self.conn.commit()
+    async def initialize(self):
+        """Asynchronous initializer to create the table."""
+        await self._create_table()
 
-    def insert_or_update(self,robot:RobotFileParser, text:str):
+    async def _create_table(self):
+        # Create a table to store robots.txt data
+        await self.conn.execute(f'''
+            CREATE TABLE IF NOT EXISTS {self.table_name} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                last_checked INTEGER,
+                url TEXT UNIQUE,
+                host TEXT,
+                path TEXT,
+                disallow_all BOOLEAN,
+                allow_all BOOLEAN,
+                text TEXT CHECK(length(text) <= 512000)  -- Limit to 500 KiB
+            )
+        ''')
+        await self.conn.commit()
+
+    async def insert_or_update(self, robot: RobotFileParser, text: str):
+        """Insert or update the robots.txt data for a given URL."""
         url = robot.url
         host = robot.host
         path = robot.path
         disallow_all = robot.disallow_all
         allow_all = robot.allow_all
         
-        """Insert or update the robots.txt data for a given URL."""
         last_checked = int(time.time())  # Store the current timestamp
-        with self.lock:
-            self.cursor.execute(f'''
-                INSERT INTO {self.table_name} (last_checked, url, host, path, disallow_all, allow_all, text)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(url) DO UPDATE SET
-                    last_checked = excluded.last_checked,
-                    host = excluded.host,
-                    path = excluded.path,
-                    disallow_all = excluded.disallow_all,
-                    allow_all = excluded.allow_all,
-                    text = excluded.text
-            ''', (last_checked, url, host, path, disallow_all, allow_all, text))
-            self.conn.commit()
+        await self.conn.execute(f'''
+            INSERT INTO {self.table_name} (last_checked, url, host, path, disallow_all, allow_all, text)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(url) DO UPDATE SET
+                last_checked = excluded.last_checked,
+                host = excluded.host,
+                path = excluded.path,
+                disallow_all = excluded.disallow_all,
+                allow_all = excluded.allow_all,
+                text = excluded.text
+        ''', (last_checked, url, host, path, disallow_all, allow_all, text))
+        await self.conn.commit()
 
-    def get(self, url):
+    async def get(self, url):
         """Retrieve the robots.txt data for a given URL."""
-        with self.lock:
-            self.cursor.execute(f'SELECT * FROM {self.table_name} WHERE url = ?', (url,))
-            robot = self.cursor.fetchone()
-            robots =RobotFileParser(robot[2])
-            robots.parse(robot[7].split('\n'))
-            robots.disallow_all = robot[5]
-            robots.allow_all = robot[6]
-            robots.last_checked = robot[1]
-            robots.path = robot[4]
-            robots.host = robot[3]
-            robots.url = robot[2]
-            return robots
-            
+        async with self.conn.execute(f'SELECT * FROM {self.table_name} WHERE url = ?', (url,)) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                raise KeyError(f"Robots.txt for URL '{url}' not found.")
 
-    def remove(self, url):
+            # Reconstruct the RobotFileParser object
+            robot = RobotFileParser(row[2])
+            robot.host = row[3]
+            robot.path = row[4]
+            robot.disallow_all = bool(row[5])
+            robot.allow_all = bool(row[6])
+            robot.last_checked = row[1]
+            robot.parse(row[7].splitlines())
+
+            return robot
+
+    async def remove(self, url):
         """Remove the entry for a given URL."""
-        with self.lock:
-            self.cursor.execute(f'DELETE FROM {self.table_name} WHERE url = ?', (url,))
-            self.conn.commit()
+        await self.conn.execute(f'DELETE FROM {self.table_name} WHERE url = ?', (url,))
+        await self.conn.commit()
 
-    def clear(self):
+    async def clear(self):
         """Clear all entries in the robots.txt dictionary."""
-        with self.lock:
-            self.cursor.execute(f'DELETE FROM {self.table_name}')
-            self.conn.commit()
+        await self.conn.execute(f'DELETE FROM {self.table_name}')
+        await self.conn.commit()
 
-    def keys(self):
+    async def keys(self):
         """Return a list of all keys (URLs)."""
-        with self.lock:
-            self.cursor.execute(f'SELECT url FROM {self.table_name}')
-            return [row[0] for row in self.cursor.fetchall()]
+        async with self.conn.execute(f'SELECT url FROM {self.table_name}') as cursor:
+            rows = await cursor.fetchall()
+            return [row[0] for row in rows]
 
-    def values(self):
+    async def values(self):
         """Return a list of all values (robots.txt texts)."""
-        with self.lock:
-            self.cursor.execute(f'SELECT text FROM {self.table_name}')
-            return [row[0] for row in self.cursor.fetchall()]
+        async with self.conn.execute(f'SELECT text FROM {self.table_name}') as cursor:
+            rows = await cursor.fetchall()
+            return [row[0] for row in rows]
 
-    def items(self):
+    async def items(self):
         """Return a list of all items (URL, text) pairs."""
-        with self.lock:
-            self.cursor.execute(f'SELECT url, text FROM {self.table_name}')
-            return [(row[0], row[1]) for row in self.cursor.fetchall()]
+        async with self.conn.execute(f'SELECT url, text FROM {self.table_name}') as cursor:
+            rows = await cursor.fetchall()
+            return [(row[0], row[1]) for row in rows]
 
-    def pop(self, url):
+    async def pop(self, url):
         """Remove and return the robots.txt data for a given URL."""
-        with self.lock:
-            data = self.get(url)
-            if data is None:
-                raise KeyError(f"{url} not found in dictionary")
-            self.remove(url)
-            return data
+        data = await self.get(url)
+        await self.remove(url)
+        return data
 
-    def popitem(self):
+    async def popitem(self):
         """Remove and return an arbitrary (URL, text) pair."""
-        with self.lock:
-            self.cursor.execute(f'SELECT url, text FROM {self.table_name} LIMIT 1')
-            result = self.cursor.fetchone()
+        async with self.conn.execute(f'SELECT url, text FROM {self.table_name} LIMIT 1') as cursor:
+            result = await cursor.fetchone()
             if result:
                 url, text = result
-                self.remove(url)
+                await self.remove(url)
                 return url, text
             raise KeyError("popitem from an empty dictionary")
 
-    def setdefault(self, url, default=None):
+    async def setdefault(self, url, default=None):
         """Return the value for a URL, and if not present, insert it with the default value."""
-        with self.lock:
-            item = self.get(url)
-            if item is None:
-                self.insert_or_update(url, "", "", False, True, default)
-                return default
-            return item[7]  # Return the text
+        try:
+            item = await self.get(url)
+        except KeyError:
+            # If the item does not exist, insert it with the default value
+            await self.insert_or_update(RobotFileParser(url), default)
+            return default
+        return item.text
 
-    def update(self, other):
-        """Update the dictionary with key/value pairs from other."""
-        with self.lock:
-            for url, data in other.items():
-                self.insert_or_update(url, *data)
+    async def update(self, other):
+        """Update the dictionary with key/value pairs from another dictionary."""
+        for url, data in other.items():
+            robot = RobotFileParser(url)
+            robot.parse(data[1].splitlines())
+            await self.insert_or_update(robot, data[1])
 
-    def copy(self):
+    async def copy(self):
         """Return a shallow copy of the dictionary."""
-        with self.lock:
-            self.cursor.execute(f'SELECT * FROM {self.table_name}')
-            return {row[2]: row[7] for row in self.cursor.fetchall()}  # url: text
+        async with self.conn.execute(f'SELECT * FROM {self.table_name}') as cursor:
+            rows = await cursor.fetchall()
+            return {row[2]: row[7] for row in rows}  # url: text
 
-    def __contains__(self, url):
+    async def __contains__(self, url):
         """Check if a URL is in the dictionary."""
-        with self.lock:
-            self.cursor.execute(f'SELECT url FROM {self.table_name} WHERE url = ?', (url,))
-            return self.cursor.fetchone() is not None
+        async with self.conn.execute(f'SELECT url FROM {self.table_name} WHERE url = ?', (url,)) as cursor:
+            result = await cursor.fetchone()
+            return result is not None
 
-    def __len__(self):
+    async def __len__(self):
         """Return the number of items in the dictionary."""
-        with self.lock:
-            self.cursor.execute(f'SELECT COUNT(*) FROM {self.table_name}')
-            return self.cursor.fetchone()[0]
+        async with self.conn.execute(f'SELECT COUNT(*) FROM {self.table_name}') as cursor:
+            result = await cursor.fetchone()
+            return result[0]
 
-    def __iter__(self):
+    async def __iter__(self):
         """Return an iterator for the dictionary's keys (URLs)."""
-        return iter(self.keys())
+        keys = await self.keys()
+        return iter(keys)
 
-    def __getitem__(self, url):
+    async def __getitem__(self, url):
         """Retrieve the robots.txt data for a given URL."""
-        data = self.get(url)
-        if data is None:
-            raise KeyError(f"{url} not found in dictionary")
-        return data
+        return await self.get(url)
 
-    def __setitem__(self, url, value):
+    async def __setitem__(self, url, value):
         """Insert or update the robots.txt data for a given URL."""
-        self.insert_or_update(url, *value)
+        await self.insert_or_update(url, value)
 
-    def __delitem__(self, url):
+    async def __delitem__(self, url):
         """Remove the entry for a given URL."""
-        self.remove(url)
+        await self.remove(url)
 
     def __repr__(self):
         """Return a string representation of the dictionary."""
-        return str(self.items())
+        return str(asyncio.run(self.items()))
 
-    def __del__(self):
+    async def close(self):
         """Close the database connection."""
-        with self.lock:
-            self.conn.close()
+        await self.conn.close()
 
 # Example usage
-if __name__ == "__main__":
-    conn = sqlite3.connect(":memory:", check_same_thread=False)
+async def main():
+    conn = await aiosqlite.connect(":memory:")
     sql_dict = SQLDictClass(conn)
+    await sql_dict.initialize()
 
     # Insert example data
-    sql_dict.insert_or_update(
-        url="https://example.com/robots.txt",
-        host="example.com",
-        path="/",
-        disallow_all=False,
-        allow_all=True,
-        text="User-agent: *\nDisallow: /private/"
-    )
+    robot_parser = RobotFileParser("https://example.com/robots.txt")
+    robot_parser.parse("User-agent: *\nDisallow: /private/".splitlines())
+    await sql_dict.insert_or_update(robot_parser, "User-agent: *\nDisallow: /private/")
 
     # Retrieve the data
-    print(sql_dict.get("https://example.com/robots.txt"))
+    robot = await sql_dict.get("https://example.com/robots.txt")
+    print(robot)
 
     # Use dictionary methods
-    print("Keys:", sql_dict.keys())
-    print("Values:", sql_dict.values())
-    print("Items:", sql_dict.items())
+    print("Keys:", await sql_dict.keys())
+    print("Values:", await sql_dict.values())
+    print("Items:", await sql_dict.items())
 
     # Pop an item
-    print("Popped item:", sql_dict.pop("https://example.com/robots.txt"))
+    print("Popped item:", await sql_dict.pop("https://example.com/robots.txt"))
 
     # Check the current state
-    print("Current state:", sql_dict)
+    print("Current state:", await sql_dict.items())
 
     # Clear the dictionary
-    sql_dict.clear()
+    await sql_dict.clear()
 
     # Close the connection
-    conn.close()
+    await sql_dict.close()

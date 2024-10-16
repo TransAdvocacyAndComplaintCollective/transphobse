@@ -4,7 +4,7 @@ import unicodedata
 
 
 KEYWORDS = [
-    "lgb",
+    # "lgb",
     "māhū",
     "muxe",
     "hijra",
@@ -16,7 +16,7 @@ KEYWORDS = [
     "demiboy",
     "demiguy",
     "LGBTQIA",
-    "gender-",
+    # "gender-",
     "intersex",
     "demienby",
     "bigender",
@@ -51,7 +51,7 @@ KEYWORDS = [
     "tranvestia",
     "Sex rights",
     "wrong body",
-    "women-only",
+    # "women-only",
     "'akava'ine",
     "demigender",
     "sex change",
@@ -77,7 +77,7 @@ KEYWORDS = [
     "intersex man",
     "misgendering",
     "third gender",
-    "gender-based",
+    # "gender-based",
     "shapeshifter",
     "trans rights",
     "trans issues",
@@ -89,7 +89,6 @@ KEYWORDS = [
     "trans advocacy",
     "transmasculine",
     "affirming care",
-    "intersectional",
     "vakasalewalewa",
     "biological man",
     "gender identity",
@@ -121,7 +120,7 @@ KEYWORDS = [
     "biological female",
     "gender specialist",
     "assigned at birth",
-    "intersectionality",
+    # "intersectionality",
     "genderqueer person",
     "genderqueer people",
     "adult human female",
@@ -147,6 +146,10 @@ KEYWORDS = [
     "trans exclusionary feminism",
     "rapid onset gender dysphoria",
     "trans-exclusionary radical feminist",
+    "LGB Alliance",
+    "Scottish Women in sport",
+    "sex matter",
+    "iftcc"
 ]
 
 
@@ -862,165 +865,3 @@ ANTI_KEYWORDS = [
 
 OGS_KEYWORDS = {}
 KEYWORD_SYNONYMS = {}
-import re
-import spacy
-import numpy as np
-from sentence_transformers import SentenceTransformer, util
-import yake
-from rake_nltk import Rake
-import unicodedata
-
-# Initialize NLP tools and models
-nlp = spacy.load("en_core_web_md")  # 'en_core_web_lg' can also be used
-model = SentenceTransformer("paraphrase-MiniLM-L6-v2")
-# Initialize YAKE and RAKE
-kw_extractor = yake.KeywordExtractor()
-r = Rake()
-
-# Cache to store phrase embeddings
-phrase_embedding_cache = {}
-
-# Function to cache phrase embeddings
-def get_phrase_embedding(phrase: str):
-    if phrase not in phrase_embedding_cache:
-        phrase_embedding_cache[phrase] = model.encode(phrase, convert_to_tensor=True, show_progress_bar=True)
-    return phrase_embedding_cache[phrase]
-
-# Core matching function with improved error handling and logic
-def smart_kay_prace_maching(
-    text: str,
-    phrases: list[str],
-    irrelevant_phrases: list[str],
-    similarity_threshold: float = 0.9,
-) -> tuple[int, list[str], list[str]]:
-    keyword_output = []
-    total_score = 0
-    text = text.lower()
-
-    # Extract keywords using YAKE and RAKE
-    keywords = [kw for kw, score in kw_extractor.extract_keywords(text)]
-    r.extract_keywords_from_text(text)
-    ranked_phrases = r.get_ranked_phrases()
-
-    # Combine keywords and ranked phrases
-    combined_keywords = list(set(keywords + ranked_phrases))
-
-    # Batch encode the combined keywords
-    text_embeddings = model.encode(combined_keywords, convert_to_tensor=True)
-
-    # Cache and batch encode the phrases
-    phrase_embeddings = [get_phrase_embedding(phrase) for phrase in phrases]
-    irrelevant_phrase_embeddings = [get_phrase_embedding(phrase) for phrase in irrelevant_phrases]
-
-    # Convert to NumPy arrays for faster similarity calculations
-    phrase_embeddings = np.array([emb.cpu().numpy() for emb in phrase_embeddings])
-    irrelevant_phrase_embeddings = np.array([emb.cpu().numpy() for emb in irrelevant_phrase_embeddings])
-    text_embeddings_np = np.array([emb.cpu().numpy() for emb in text_embeddings])
-    outputs = {}
-    # Calculate similarity between text keywords and phrases
-    for i, phrase_embedding in enumerate(phrase_embeddings):
-        phrase = phrases[i]
-
-        try:
-            similarities = util.pytorch_cos_sim(text_embeddings_np, phrase_embedding).numpy().flatten()
-            for j, similarity in enumerate(similarities):
-                if similarity > similarity_threshold and len(combined_keywords[j]) >= 5:
-                    keyword = combined_keywords[j]
-                    outputs[keyword] = {
-                        "phrase": phrase,
-                        "similarity_good": max(similarity, outputs.get(keyword, {}).get("similarity_good", 0)),
-                        "length_phrase": len(phrase),
-                        "text_embedding": text_embeddings_np[j],
-                    }
-
-        except ValueError:
-            print(f"Skipping due to incompatible dimensions for keyword: {phrase}")
-
-    # Check for irrelevant phrases and their similarity
-    for keyword, output in outputs.items():
-        bad_similarities = util.pytorch_cos_sim(np.array([output["text_embedding"]]), irrelevant_phrase_embeddings).numpy().flatten()
-        max_bad_similarity = np.max(bad_similarities)
-        if max_bad_similarity > similarity_threshold:
-            outputs[keyword]["similarity_bad"] = max_bad_similarity
-
-    # Calculate final score
-    for output in outputs.values():
-        score = (output["similarity_good"] - output.get("similarity_bad", 0)) * output["length_phrase"]
-        if score > 0:
-            total_score += score
-            keyword_output.append(output["phrase"])
-
-    return total_score, keyword_output
-
-def normalize_text(text):
-    if not text:
-        return ""
-    text = re.sub(r"[-_\\n]", " ", text)
-    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("utf-8")
-    text = re.sub(r"[^\w\s]", "", text)
-    return re.sub(r"\s+", " ", text).strip().lower()
-
-def find_keyword_positions(text, keywords, relevant_window, irrelevant_phrases):
-    found_keywords = []
-    for keyword in keywords:
-        normalized_keyword = normalize_text(keyword)
-        for match in re.finditer(r"\b" + re.escape(normalized_keyword) + r"\b", text, re.IGNORECASE):
-            start, end = match.start(), match.end()
-            surrounding_text = text[max(0, start - relevant_window): end + relevant_window]
-            if not contains_irrelevant(irrelevant_phrases, surrounding_text):
-                found_keywords.append((keyword, start, end))
-    return found_keywords
-
-def contains_irrelevant(phrases, segment):
-    return any(re.search(r"\b" + re.escape(phrase) + r"\b", segment, re.IGNORECASE) for phrase in phrases)
-
-def relative_keywords_score(text: str,bypass_anit=False):
-    text = normalize_text(text)
-    if not text:
-        return 0, [], []
-    
-    relevant_window = 50
-    processed_positions = set()
-
-    found_keywords = find_keyword_positions(text, KEYWORDS, relevant_window, irrelevant_for_keywords)
-
-    score = calculate_keyword_score(found_keywords, processed_positions, len(text))
-    
-    
-    if not bypass_anit:
-        found_anti_keywords = find_keyword_positions(text, ANTI_KEYWORDS, relevant_window, irrelevant_for_keywords)
-        anti_score = calculate_keyword_score(found_anti_keywords, processed_positions, len(text))
-    else:
-        found_anti_keywords = []
-        anti_score = 0
-    
-    final_score = score - anti_score
-    if final_score < 0:
-        score , found_keywords =smart_kay_prace_maching(text, KEYWORDS, irrelevant_for_keywords)
-        final_score = score - anti_score
-
-
-    return final_score, list(set([kw for kw, _, _ in found_keywords])), list(set([kw for kw, _, _ in found_anti_keywords]))
-def calculate_keyword_score(found_keywords, processed_positions, text_length):
-    score = 0
-    keyword_frequencies = {keyword: 0 for keyword, _, _ in found_keywords}
-
-    for keyword, start, end in found_keywords:
-        # Increment the keyword frequency
-        keyword_frequencies[keyword] += 1
-
-        if not any(pos in processed_positions for pos in range(start, end)):
-            keyword_weight = len(keyword.split())
-            frequency_boost = keyword_frequencies[keyword]
-            # Ensure the frequency boost is at least 1
-            if frequency_boost == 0:
-                frequency_boost = 1
-            positional_boost = max(1, (text_length - start) / text_length * 2)
-            
-            # Log the calculation process for debugging
-            logging.info(f"Keyword: {keyword}, Frequency Boost: {frequency_boost}, Positional Boost: {positional_boost}")
-            
-            score += keyword_weight * frequency_boost * positional_boost
-            processed_positions.update(range(start, end))
-
-    return score
