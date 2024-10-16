@@ -119,13 +119,13 @@ def relative_keywords_score(text: str, bypass_anit=False):
         found_anti_keywords = []
         anti_score = 0
     
-    final_score = score - anti_score
-    if final_score <= 0:
-        try:
-            score, found_keywords = smart_kay_prace_maching(text, kw.KEYWORDS, kw.irrelevant_for_keywords)
-            final_score = score - anti_score
-        except Exception as e:
-            print(f"Error during processing: {e}")
+    final_score = score 
+    # if final_score <= 0:
+    #     try:
+    #         score, found_keywords = smart_kay_prace_maching(text, kw.KEYWORDS, kw.irrelevant_for_keywords)
+    #         final_score = score - anti_score
+    #     except Exception as e:
+    #         print(f"Error during processing: {e}")
 
     return final_score, list(set(found_keywords)), list(set(found_anti_keywords))
 

@@ -213,7 +213,9 @@ class KeyPhraseFocusCrawler:
         if url is None:
             return
         normalized_url = self.normalize_url(url)
-
+        if not self.is_valid_url(normalized_url):
+            logger.error(f"Invalid URL found: {url}")
+            return
         # Exclude URLs from excluded subdirectories
         for exclude_subdir in self.exclude_subdirs_cruel:
             if exclude_subdir in normalized_url:
