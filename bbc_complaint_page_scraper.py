@@ -4,12 +4,13 @@ from bs4 import BeautifulSoup
 from PyPDF2 import PdfReader
 from io import BytesIO
 import csv
-from utils.keywords import relative_keywords_score
 import urllib.parse
+from utils.keywords_finder import KeypaceFinder
 
+keypaceFinder =  KeypaceFinder()
 # Function to scan text for keywords
 def contains_keywords(text, bypass_anit=False):
-    final_score, keywords, anti_keywords, word_mached = relative_keywords_score(text, bypass_anit)
+    final_score, keywords,_ = keypaceFinder.relative_keywords_score(text)
     if final_score > 0:
         return True, keywords
     return False, []

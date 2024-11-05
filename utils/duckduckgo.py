@@ -6,7 +6,7 @@ def lookup_duckduckgo(keyword, domain):
     for i in range(10):
         try:
             ddgs = DDGS()
-            text = f"{keyword} site:{domain}"
+            text = f"\"{keyword}\" site:{domain}"
             results = ddgs.text(text)
             for result in results:
                 yield result

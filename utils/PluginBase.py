@@ -70,3 +70,5 @@ class PluginBase:
     def on_crawl_resumed(self, crawler):
         """Hook called when the crawl is resumed."""
         pass
+    def by_pass_robots(self,url):
+        return False

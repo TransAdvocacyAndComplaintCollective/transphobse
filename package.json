@@ -3,6 +3,7 @@
     "@mozilla/readability": "github:mozilla/readability",
     "dompurify": "^3.1.6",
     "jsdom": "^25.0.1",
-    "node-fetch": "^3.3.2"
+    "node-fetch": "^3.3.2",
+    "pythonia": "^1.2.1"
   }
 }

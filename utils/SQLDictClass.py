@@ -3,9 +3,10 @@ from urllib.robotparser import RobotFileParser
 import aiosqlite
 
 class SQLDictClass:
-    def __init__(self, conn, table_name="robot_dict"):
+    def __init__(self, conn, table_name="robot_dict",thread_pool=None):
         self.table_name = table_name
         self.conn = conn
+        self.thread_pool =thread_pool
 
     async def initialize(self):
         """Asynchronous initializer to create the table."""

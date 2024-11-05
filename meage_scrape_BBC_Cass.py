@@ -39,12 +39,13 @@ async def main():
     crawler = KeyPhraseFocusCrawler(
         start_urls,
         feeds,
-        "BBC_news_mage_scrape",
+        "BBC_news_mage_scrape_cass",
         allowed_subdirs_cruel=allowed_subdirs_cruel,
         start_data=start_data,
         end_data=end_data,
         exclude_lag=exclude_lag,
         exclude_subdirs_cruel=exclude_subdirs_cruel,
+        keywords=["cass"]
     )
     # crawler.crawl_init()
 

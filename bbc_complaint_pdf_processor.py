@@ -1,377 +1,335 @@
-import os
-import requests
-import time
-import logging
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin, unquote
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from PyPDF2 import PdfReader
-import camelot
-import pandas as pd
 import difflib
+import threading
+from urllib.parse import urlparse, urljoin, unquote
+import requests
+from bs4 import BeautifulSoup
+from PyPDF2 import PdfReader
+import os
+import logging
+import time
+import pandas as pd
+import camelot
+import re
 
-from utils.keywords import relative_keywords_score
+from utils.keywords_finder import KeypaceFinder
 
-# Configuration
-BASE_URL = "https://www.bbc.co.uk/contact/complaint-service-reports?page={}"
-PDF_DIR = 'data/bbc_complaint_pdfs'
-CSV_OUTPUT_DIR = 'data/data/csv_outputs'
-UNMATCHED_URLS_OUTPUT_DIR = 'data/unmatched_urls'
-MASTER_CSV_OUTPUT = 'data/bbc_transphobia_complaint_service_reports_keywords_matched.csv'
-os.makedirs(PDF_DIR, exist_ok=True)
-os.makedirs(CSV_OUTPUT_DIR, exist_ok=True)
-os.makedirs(UNMATCHED_URLS_OUTPUT_DIR, exist_ok=True)
+headers = {
+    "User-Agent": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/png,image/svg+xml,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "cross-site",
+    "Sec-GPC": "1",
+    "If-Modified-Since": "Fri, 17 May 2024 11:07:07 GMT",
+    "If-None-Match": "\"66473a5b-6c734\"",
+    "Priority": "u=0, i"
+}
 
-# Setup logging
-logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
+class BBCComplaintScraper:
+    EXPECTED_HEADERS = ["Programme", "Service", "Date of Transmission", "Issue", "Outcome"]
 
-# Expected headers
-EXPECTED_HEADERS = ["Programme", "Service", "Date of Transmission", "Issue", "Outcome"]
+    def __init__(self):
+        self.keypaceFinder = KeypaceFinder()
+        self.PDF_DIR = "data/bbc_complaint_pdfs"
+        self.CSV_OUTPUT_DIR = "data/data/csv_outputs"
+        self.MASTER_CSV_OUTPUT = "data/bbc_transphobia_complaint_service_reports_keywords_matched.csv"
+        self.UNMATCHED_URLS_OUTPUT_DIR = "data/unmatched_urls"
+        os.makedirs(self.PDF_DIR, exist_ok=True)
+        os.makedirs(self.CSV_OUTPUT_DIR, exist_ok=True)
+        os.makedirs(self.UNMATCHED_URLS_OUTPUT_DIR, exist_ok=True)
+        
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+        
+        self.csv_lock = threading.Lock()
+        self.c = set()  # For tracking processed URLs
+        
+        # Initialize Master CSV
+        if not os.path.exists(self.MASTER_CSV_OUTPUT):
+            master_headers = ["Programme", "Service", "Date of Transmission", "Issue", "Outcome",
+                              "keywords", "anti-keywords", "Score", "type (HTML/PDF)", "url html", "url Pdf", 
+                              "URL", "time", "item_time", "category", "Page", "row_index"]
+            pd.DataFrame(columns=master_headers).to_csv(self.MASTER_CSV_OUTPUT, index=False)
 
-# Create the master CSV file
-master_csv_headers = ["Programme", "Service", "Date of Transmission", "Issue", "Outcome", "keywords", "anti-keywords", "Score", "type (HTML/PDF)", "url html", "url Pdf", "URL",  "time","item_time"]
-with open(MASTER_CSV_OUTPUT, 'w') as f:
-    pd.DataFrame(columns=master_csv_headers).to_csv(f, index=False)
-
-# Function to scrape the content from the web page pointed to by a URL
-def scrape_web_content(url):
-    try:
-        response = requests.get(url, timeout=60)
-        response.raise_for_status()  # Check if the request was successful
-        soup = BeautifulSoup(response.content, "html.parser")
-        return ' '.join([p.text for p in soup.find_all('p')])
-    except requests.RequestException as e:
-        logging.error(f"Failed to scrape {url}: {e}")
-        return ""
-
-
-# Function to download PDFs
-def download_pdf(pdf_url, url_html, time, retries=3):
-    local_filename = os.path.join(PDF_DIR, unquote(os.path.basename(pdf_url)))
-    attempt = 0
-    while attempt < retries:
+    def clean_newlines(self, df):
+        return df.applymap(lambda x: x.replace('\n', ' ') if isinstance(x, str) else x)
+    
+    def is_bbox_overlap(self, bbox1, bbox2):
+        x1_1, y1_1, x2_1, y2_1 = bbox1
+        x1_2, y1_2, x2_2, y2_2 = bbox2
+        return not (x2_1 < x1_2 or x2_2 < x1_1 or y2_1 < y1_2 or y2_2 < y1_1)
+    
+    def scrape_web_content(self, url):
         try:
-            response = requests.get(pdf_url, timeout=10)
+            response = requests.get(url, timeout=60, headers=headers)
             response.raise_for_status()
-            with open(local_filename, 'wb') as f:
-                f.write(response.content)
-            return local_filename, url_html, pdf_url, time
+            soup = BeautifulSoup(response.content, "html.parser")
+            return ' '.join([p.text for p in soup.find_all('p')])
         except requests.RequestException as e:
-            attempt += 1
-            logging.error(f"Failed to download {pdf_url}: {e}. Retrying {attempt}/{retries}...")
-            time.sleep(2)
-    return None, None, None, None
-
-c = set()
-# Function to try matching unmatched URLs
-def match_unmatched_urls(cleaned_df, unmatched_links):
-    unmatched_links_temp = unmatched_links.copy()
-    for url in unmatched_links:
-        if url in c:
-            continue
-        c.add(url)
-        print(f"Processing unmatched URL: {url}")
-        best_match_row = None
-        best_match_score = 0
-        url_text = url.lower()
-
-        # First attempt: Fuzzy match against "Programme", "Service", "Date of Transmission" in the URL
-        for index, row in cleaned_df.iterrows():
-            row_text = ' '.join(map(str, [row.get("Programme", ""), row.get("Service", ""), row.get("Date of Transmission", "")])).lower()
-            match_score = difflib.SequenceMatcher(None, url_text, row_text).ratio()
-
-            if match_score > best_match_score and match_score > 0.5:  # Threshold of 0.5
-                best_match_row = index
-                best_match_score = match_score
-
-        if best_match_row is None:
-            # Second attempt: Scrape the web page and match its content
-            web_content = scrape_web_content(url)
+            logging.error(f"Failed to scrape {url}: {e}")
+            return ""
+    
+    def clean_and_assign_headers(self, df):
+        df = self.clean_newlines(df)
+        if len(df.columns) != len(self.EXPECTED_HEADERS):
+            logging.warning(f"Table has {len(df.columns)} columns, but expected {len(self.EXPECTED_HEADERS)}")
+            df.columns = ['Column' + str(i) for i in range(len(df.columns))]
+        else:
+            df.columns = self.EXPECTED_HEADERS
+        return df
+    
+    def match_unmatched_urls(self, cleaned_df, unmatched_links):
+        unmatched_links_temp = unmatched_links.copy()
+        for url in unmatched_links:
+            if url in self.c:
+                continue
+            self.c.add(url)
+            best_match_row = None
+            best_match_score = 0
+            url_text = url.lower()
             for index, row in cleaned_df.iterrows():
-                row_text = ' '.join(map(str, row)).lower()
-                match_score = difflib.SequenceMatcher(None, web_content, row_text).ratio()
-
+                row_text = ' '.join(map(str, [row.get("Programme", ""), row.get("Service", ""), row.get("Date of Transmission", "")])).lower()
+                match_score = difflib.SequenceMatcher(None, url_text, row_text).ratio()
                 if match_score > best_match_score and match_score > 0.5:
                     best_match_row = index
                     best_match_score = match_score
-
-        if best_match_row is None:
-            # Third attempt: Best effort fuzzy match
-            for index, row in cleaned_df.iterrows():
-                row_text = ' '.join(map(str, row)).lower()
-                match_score = difflib.SequenceMatcher(None, url_text, row_text).ratio()
-
-                if match_score > best_match_score:
-                    best_match_row = index
-                    best_match_score = match_score
-
-        # Assign the URL to the best matching row if found
-        if best_match_row is not None and pd.isna(cleaned_df.at[best_match_row, 'URL']):
-            cleaned_df.at[best_match_row, 'URL'] = url
-            print(f"Matched unmatched URL {url} to row {best_match_row} with score {best_match_score}")
-            unmatched_links_temp.remove(url)
-
-    # Capture unmatched URLs that couldn't be assigned
-    remaining_unmatched_links = cleaned_df[cleaned_df['URL'].isna()]
-
-    return cleaned_df, unmatched_links_temp
-
-# Function to process each page of the website and extract PDF links
-def process_page(page_number):
-    url = BASE_URL.format(page_number)
-    try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.content, "html.parser")
-        pdf_links = []
-        iz = soup.select('div.tile.white-bg')
-        for z in iz:
-            time_elem = z.find("time")
-            link = z.find("a")
-            if time_elem and link and "href" in link.attrs:
-                if link['href'].endswith('.pdf') and 'Complaints_Framework_eng' not in link['href']:
-                    pdf_links.append({"time": time_elem.text, "link": urljoin(url, link['href']), "text": link.text})
-                
-        if not pdf_links:
-            return [], url  # Return empty list and the page URL when no PDF links are found
-
-        return pdf_links, url  # Return both the PDF links and the current page URL
-    except requests.RequestException as e:
-        logging.error(f"Failed to process page {page_number}: {e}")
-    return [], None  # Return empty list and None when the request fails
-
-# Function to clean newline characters from the data
-def clean_newlines(df):
-    return df.map(lambda x: x.replace('\n', ' ') if isinstance(x, str) else x)
-
-# Function to check if two bounding boxes overlap
-def is_bbox_overlap(bbox1, bbox2):
-    x1_1, y1_1, x2_1, y2_1 = bbox1
-    x1_2, y1_2, x2_2, y2_2 = bbox2
-    return not (x2_1 < x1_2 or x2_2 < x1_1 or y2_1 < y1_2 or y2_2 < y1_1)
-
-# Function to clean and assign headers to a table
-def clean_and_assign_headers(df):
-    df = clean_newlines(df)
-    if len(df.columns) != len(EXPECTED_HEADERS):
-        logging.warning(f"Table has {len(df.columns)} columns, but expected {len(EXPECTED_HEADERS)}")
-        df.columns = ['Column' + str(i) for i in range(len(df.columns))]  # Auto-assign column names
-    else:
-        df.columns = EXPECTED_HEADERS
-    return df
-
-# Function to match URL to row based on bounding boxes
-def match_url_to_row(table, pdf_links):
-    page_links = pdf_links.get(table.page - 1, [])
-    matched_links = []
-    unmatched_links = set()
-    output = []
-
-    for row_id, rows in enumerate(table.cells):
-        for cell in rows:
-            cell_bbox = (cell.x1, cell.y1, cell.x2, cell.y2)
-            matched = False
-            for link in page_links:
-                if link and isinstance(link, dict) and 'rect' in link and 'uri' in link:
-                    link_bbox = (link['rect'][0], link['rect'][1], link['rect'][2], link['rect'][3])
-                    if is_bbox_overlap(cell_bbox, link_bbox):
-                        matched_links.append((cell_bbox, link['uri']))
-                        print(f"Matched link {link['uri']} with cell bounding box {cell_bbox}")
-                        output.append({"row_id": row_id, "cell_bbox": cell_bbox, "link": link['uri']})
-                        matched = True
-                        break
-            if not matched:
-                unmatched_links.add(link['uri'] if link and 'uri' in link else None)
-
-    return matched_links, list(unmatched_links), output
-
-# Function to extract tables from a PDF and save them as CSVs, and ensure all pages are logged
-def extract_tables_from_pdf(pdf_path, url_html, score, keywords, anti_keywords, pdf_url, report_data,fallback_socre =0,fallback_keywords =[],fallback_anti_keywords=[]):
-    try:
-        # Initialize PDF reader
-        reader = PdfReader(pdf_path)
-        
-        # Attempt to read tables using 'lattice' flavor first
-        tables = camelot.read_pdf(pdf_path, pages='all', flavor='lattice')
-
-        # If no tables are found using 'lattice', try 'stream' flavor
-        if not tables or all(len(table.df) == 0 for table in tables):
-            tables = camelot.read_pdf(pdf_path, pages='all', flavor='stream')
-
-        # If still no valid tables, log and skip the file
-        if not tables or all(len(table.df) == 0 for table in tables):
-            logging.info(f"No valid tables found in {pdf_path}. Skipping file.")
-            append_to_master_csv({}, keywords, anti_keywords, score, 'full_pdf', url_html, pdf_path, pdf_url, report_data)
-            return
-
-        # Extract links from PDF annotations (all page links, even if they don't match table rows)
-        output_pdf_links = extract_links_from_pdf(reader)
-
-        # Process each detected table
-        for i, table in enumerate(tables):
-            if not table.df.empty:  # Only process tables with data
-                # Get matched links and unmatched links for each table row
-                matched_links, unmatched_links, matched_links_row_info = match_url_to_row(table, output_pdf_links)
-                cleaned_df = clean_and_assign_headers(table.df)
-
-                # Log all table rows, even if they don't have matching URLs
-                cleaned_df['URL'] = None
-                for link_info in matched_links_row_info:
-                    row_id = link_info['row_id']
-                    url = link_info['link']
-                    if row_id < len(cleaned_df):
-                        cleaned_df.at[row_id, 'URL'] = url
-
-                # Log unmatched URLs and associate them with the PDF-level data
-                cleaned_df, remaining_unmatched_links = match_unmatched_urls(cleaned_df, unmatched_links)
-                
-                for url in remaining_unmatched_links:
-                    unmatched_url_file = os.path.join(UNMATCHED_URLS_OUTPUT_DIR, f"{os.path.basename(pdf_path)}_unmatched_urls.csv")
-                    with open(unmatched_url_file, 'a') as f:
-                        f.write(f"{url}\n")
-                    
-                    req = requests.get(url)
-                    if req.status_code == 200:
-                        text = req.text
-                        html = BeautifulSoup(text, "html.parser")
-                        try:
-                            item_time = html.find("time").text
-                        except:
-                            item_time = "Unknown Time"
-                        final_score, keywords, anti_keywords, word_mached = relative_keywords_score(req.text)
-                        if final_score > 0:
-                            append_to_master_csv({}, keywords, anti_keywords, final_score, 'unmatched_url', url, pdf_path, pdf_url, report_data, item_time)
-
-                # Log each table row to master CSV
-                for index, row in cleaned_df.iterrows():
-                    full_text = ' '.join(map(str, row.values))
-                    final_score, keywords, anti_keywords, word_mached = relative_keywords_score(full_text)
-                    
-                    if row.get("URL"):
-                        url = row.get("URL")
-                        req = requests.get(url)
-                        if req.status_code == 200:
-                            text = req.text
-                            html = BeautifulSoup(text, "html.parser")
-                            try:
-                                item_time = html.find("time").text
-                            except:
-                                item_time = "Unknown Time"
-                            append_to_master_csv(row, keywords, anti_keywords, final_score, 'PDF_row', url_html, pdf_path, pdf_url, report_data, item_time)
-                    else:
-                        append_to_master_csv(row, keywords, anti_keywords, final_score, 'PDF_row_no_url', url_html, pdf_path, pdf_url, report_data)
-
-                # Save the cleaned DataFrame as CSV
-                csv_file_path = os.path.join(CSV_OUTPUT_DIR, f"{os.path.basename(pdf_path)}_table_{i+1}.csv")
-                cleaned_df.to_csv(csv_file_path, index=False)
-                print(f"Saved and cleaned table {i+1} with URLs to {csv_file_path}")
-
-    except Exception as e:
-        logging.error(f"Failed to extract tables from {pdf_path}: {e}")
-        append_to_master_csv({}, fallback_keywords or keywords,fallback_anti_keywords or anti_keywords, max(score,fallback_socre), 'error_pdf', url_html, pdf_path, pdf_url, report_data)
-
-# Function to extract links from PDF annotations
-def extract_links_from_pdf(reader):
-    output = {}
-    try:
+            if best_match_row is not None and pd.isna(cleaned_df.at[best_match_row, 'URL']):
+                cleaned_df.at[best_match_row, 'URL'] = url
+                unmatched_links_temp.remove(url)
+        return cleaned_df, unmatched_links_temp
+    
+    def match_url_to_row(self, table, pdf_links):
+        page_links = pdf_links.get(table.page - 1, [])
+        matched_links = []
+        unmatched_links = set()
+        output = []
+        for row_id, rows in enumerate(table.cells):
+            for cell in rows:
+                cell_bbox = (cell.x1, cell.y1, cell.x2, cell.y2)
+                matched = False
+                for link in page_links:
+                    if link and isinstance(link, dict) and 'rect' in link and 'uri' in link:
+                        link_bbox = (link['rect'][0], link['rect'][1], link['rect'][2], link['rect'][3])
+                        if self.is_bbox_overlap(cell_bbox, link_bbox):
+                            matched_links.append((cell_bbox, link['uri']))
+                            output.append({"row_id": row_id, "cell_bbox": cell_bbox, "link": link['uri']})
+                            matched = True
+                            break
+                if not matched and link and 'uri' in link:
+                    unmatched_links.add(link['uri'])
+        return matched_links, unmatched_links, output
+    
+    def _extract_links_from_pdf(self, reader):
+        output = {}
         for page_num, page in enumerate(reader.pages):
             output[page_num] = []
-            if '/Annots' in page:
-                annotations = page['/Annots']
-                for annotation in annotations:
-                    annotation_obj = annotation.get_object()
-                    if annotation_obj and isinstance(annotation_obj, dict):
-                        if '/A' in annotation_obj and '/URI' in annotation_obj['/A']:
-                            uri = annotation_obj['/A']['/URI']
-                            rect = annotation_obj.get('/Rect', None)
-                            if rect:
-                                output[page_num].append({
-                                    'page': page_num + 1,
-                                    'uri': uri,
-                                    'rect': rect
-                                })
-                            else:
-                                output[page_num].append({
-                                    'page': page_num + 1,
-                                    'uri': uri,
-                                    'rect': None
-                                })
-    except Exception as e:
-        logging.error(f"Failed to extract links from PDF: {e}")
-    return output
+            if "/Annots" in page:
+                for annotation in page["/Annots"]:
+                    obj = annotation.get_object()
+                    if obj and "/A" in obj and "/URI" in obj["/A"]:
+                        uri = obj["/A"]["/URI"]
+                        rect = obj.get("/Rect")
+                        output[page_num].append({"page": page_num + 1, "uri": uri, "rect": rect})
+        return output
+    
+    def _append_to_master_csv(self, row_data):
+        with self.csv_lock:
+            pd.DataFrame([row_data]).to_csv(self.MASTER_CSV_OUTPUT, mode="a", header=False, index=False)
+    
+    def extract_information_html(self, soup, url):
+        header = soup.find("h1", class_="gel-trafalgar")
+        complaint = soup.find("div", class_="ecu-complaint")
+        outcome = soup.find("div", class_="ececu-outcome")
+        extracted_data = {
+            "Programme": header.get_text(strip=True) if header else "N/A",
+            "Service": "N/A",
+            "Date of Transmission": "N/A",
+            "Issue": complaint.get_text(strip=True) if complaint else "N/A",
+            "Outcome": outcome.get_text(strip=True) if outcome else "N/A"
+        }
+        return extracted_data
+    
+    def extract_tables_from_pdf(self, pdf_file, url_html, pdf_url, time_item, category):
+        try:
+            logging.info(f"Extracting tables from PDF: {pdf_file}")
+            reader = PdfReader(pdf_file)
+            pdf_links = self._extract_links_from_pdf(reader)
+            tables = camelot.read_pdf(pdf_file, pages="all", flavor="stream")
+            if tables:
+                for table in tables:
+                    matched_links, unmatched_links, matched_links_row_info = self.match_url_to_row(table, pdf_links)
+                    cleaned_df = self.clean_and_assign_headers(table.df)
+                    cleaned_df['URL'] = None
+                    for link_info in matched_links_row_info:
+                        row_id = link_info['row_id']
+                        url = link_info['link']
+                        if row_id < len(cleaned_df):
+                            cleaned_df.at[row_id, 'URL'] = url
+                    cleaned_df, remaining_unmatched_links = self.match_unmatched_urls(cleaned_df, unmatched_links)
+                    for index, row in cleaned_df.iterrows():
+                        row_text = ' '.join(map(str, row.values))
+                        score, keywords, anti_keywords = self.keypaceFinder.relative_keywords_score(row_text)
+                        if score > 0:
+                            self._append_to_master_csv({
+                                "Programme": row.get("Programme", "N/A"),
+                                "Service": row.get("Service", "N/A"),
+                                "Date of Transmission": row.get("Date of Transmission", "N/A"),
+                                "Issue": row.get("Issue", "N/A"),
+                                "Outcome": row.get("Outcome", "N/A"),
+                                "keywords": ", ".join(keywords),
+                                "anti-keywords": ", ".join(anti_keywords),
+                                "Score": score,
+                                "type (HTML/PDF)": "PDF",
+                                "url html": url_html,
+                                "url Pdf": pdf_url,
+                                "URL": row.get('URL', 'N/A'),
+                                "time": time_item,
+                                "item_time": "Unknown",
+                                "category": category,
+                                "Page": table.page,
+                                "row_index": index,
+                            })
+        except Exception as e:
+            logging.error(f"Error processing PDF {pdf_file}: {e}")
+    
+    def get_full_url(self, base_url, relative_url):
+        if not relative_url:
+            return None
+        if relative_url.startswith("http"):
+            full_url = relative_url
+        else:
+            full_url = urljoin(base_url, relative_url)
+        if self.is_valid_bbc_url(full_url):
+            return full_url
+        else:
+            logging.info(f"Skipping non-BBC URL: {full_url}")
+            return None
+    
+    def is_valid_bbc_url(self, url):
+        parsed_url = urlparse(url)
+        return parsed_url.netloc.endswith(("bbc.co.uk", "bbc.com", "bbci.co.uk"))
+    def _scrape_web_content(self, full_url):
+        """
+        Scrapes web content from the given URL, returning the combined text content and a BeautifulSoup object.
+        """
+        try:
+            logging.info(f"Scraping web content from URL: {full_url}")
+            response = requests.get(full_url, timeout=60, headers=headers)
+            response.raise_for_status()  # Raise an error for HTTP issues
 
-# Function to search for keywords in the text of a PDF
-def contains_keywords(pdf_path):
-    try:
-        reader = PdfReader(pdf_path)
-        for page in reader.pages:
-            text = page.extract_text()
-            final_score, keywords, anti_keywords, word_mached = relative_keywords_score(text)
-            if final_score > 0:
-                return True, final_score, keywords, anti_keywords
-    except Exception as e:
-        logging.error(f"Failed to read PDF {pdf_path}: {e}")
-    return False, 0, None, None
+            # Parse the page content
+            soup = BeautifulSoup(response.content, "html.parser")
 
-# Function to delete the PDF file and associated CSVs
-def delete_files(pdf_path):
-    try:
-        os.remove(pdf_path)
-        print(f"Deleted PDF: {pdf_path}")
-        
-        csv_file_base = os.path.basename(pdf_path)
-        for csv_file in os.listdir(CSV_OUTPUT_DIR):
-            if csv_file.startswith(csv_file_base):
-                os.remove(os.path.join(CSV_OUTPUT_DIR, csv_file))
-                print(f"Deleted CSV: {csv_file}")
-    except Exception as e:
-        logging.error(f"Failed to delete files for {pdf_path}: {e}")
+            # Extract text from paragraphs
+            text = " ".join([p.get_text(strip=True) for p in soup.find_all("p") if p.get_text(strip=True)])
 
-# Ensure every step of the way, unmatched URLs and rows without URLs are logged
-def append_to_master_csv(row, keywords, anti_keywords, score, content_type, url_html, pdf_local_file, pdf_url, time,list_page=None,item_time=None):
-    # Append all relevant fields for both matching rows and pages
-    data = {
-        "Programme": row.get("Programme", "N/A"),
-        "Service": row.get("Service", "N/A"),
-        "Date of Transmission": row.get("Date of Transmission", "N/A"),
-        "Issue": row.get("Issue", "N/A"),
-        "Outcome": row.get("Outcome", "N/A"),
-        "keywords": ', '.join(keywords) if keywords else "N/A",
-        "anti-keywords": ', '.join(anti_keywords) if anti_keywords else "N/A",
-        "Score": score,
-        "type (HTML/PDF)": content_type,
-        "url html": url_html if url_html else "N/A",
-        "url Pdf": pdf_url if pdf_url else "N/A",
-        "url list": list_page,
-        "URL": row.get("URL", "N/A"),
-        "time": time,
-        "item_time": item_time
-    }
-    if score > 0:
-        df = pd.DataFrame([data])
-        df.to_csv(MASTER_CSV_OUTPUT, mode='a', header=False, index=False)
-        print(f"Appended to master CSV: {data}")
+            # Log warning if no text was found
+            if not text:
+                logging.warning(f"No text content found on {full_url}")
 
-# Main function to coordinate the entire process
-def main():
-    page_number = 0
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        while True:
-            pdf_links, url_html = process_page(page_number)
-            if not pdf_links:
-                break
-            future_to_url = {executor.submit(download_pdf, pdf_data["link"], url_html, pdf_data["time"]): pdf_data["link"] for pdf_data in pdf_links}
-            
-            for future in as_completed(future_to_url):
-                pdf_path, url_html, pdf_url, report_data = future.result()
-                if pdf_path:
-                    contains, score, keywords, anti_keywords = contains_keywords(pdf_path)
-                    if contains:
-                        executor.submit(extract_tables_from_pdf, pdf_path, url_html, score, keywords, anti_keywords, pdf_url, report_data,fallback_socre=score,fallback_keywords=keywords,fallback_anti_keywords=anti_keywords)
-                    else:
-                        delete_files(pdf_path)
-            page_number += 1
-            time.sleep(2)
+            return text, soup  # Return both the plain text and parsed BeautifulSoup object
+
+        except requests.Timeout:
+            logging.error(f"Timeout occurred when trying to scrape {full_url}")
+            return "", None  # Return empty text and None for soup
+
+        except requests.RequestException as e:
+            logging.error(f"Request failed for {full_url}: {e}")
+            return "", None  # Return empty text and None for soup
+
+    def process_item(self, item, url_html, category_name):
+        """
+        Process a single complaint item by extracting and analyzing content from both HTML and PDF links.
+        """
+        # Extract the main URL (HTML) and PDF URL if available
+        html_link = self.get_full_url(url_html, item.get("link"))
+        pdf_link = self.get_full_url(url_html, item.get("pdf_link"))
+        item_time = item.get("time", "Unknown")
+
+        # Process the HTML link if it exists
+        if html_link:
+            content, soup = self._scrape_web_content(html_link)
+            if soup:
+                row = self.extract_information_html(soup, html_link)
+                if content:
+                    score, keywords, anti_keywords = self.keypaceFinder.relative_keywords_score(content)
+                    if score > 0:
+                        logging.info(f"Appending HTML data for {html_link}")
+                        self._append_to_master_csv({
+                            "Programme": row.get("Programme", "N/A"),
+                            "Service": row.get("Service", "N/A"),
+                            "Date of Transmission": row.get("Date of Transmission", "N/A"),
+                            "Issue": row.get("Issue", "N/A"),
+                            "Outcome": row.get("Outcome", "N/A"),
+                            "keywords": ", ".join(keywords),
+                            "Score": score,
+                            "type (HTML/PDF)": "HTML",
+                            "url html": html_link,
+                            "url Pdf": "N/A",
+                            "URL": html_link,
+                            "time": item_time,
+                            "item_time": item_time,
+                            "category": category_name,
+                            "Page": "N/A",
+                            "row_index": "N/A",
+                        })
+
+        # Process the PDF link if it exists
+        if pdf_link:
+            pdf_file = self._download_pdf(pdf_link)
+            if pdf_file:
+                logging.info(f"Processing PDF {pdf_file}")
+                self.extract_tables_from_pdf(pdf_file, html_link, pdf_link, item_time, category_name)
+
+    def process_page(self, page_number, base_url, category_name):
+        url = base_url.format(page_number)
+        if page_number > 100:
+            return [], None
+        logging.info(f"Processing page {page_number} for category: {category_name}")
+        try:
+            response = requests.get(url, timeout=10, headers=headers)
+            if response.status_code == 404:
+                return [], None
+            response.raise_for_status()
+            soup = BeautifulSoup(response.content, "html.parser")
+            tile_items = soup.select(".tile")
+            links = []
+            seen_links = set()
+            for tile in tile_items:
+                if "white-bg" not in tile.get("class", []):
+                    continue
+                item = {"time": tile.select_one("time").get("datetime") if tile.select_one("time") else None}
+                for link in tile.find_all("a"):
+                    full_link = self.get_full_url(url, link.get("href"))
+                    if full_link and "bbc.co.uk" in full_link and full_link not in seen_links:
+                        seen_links.add(full_link)
+                        if "pdf" in full_link:
+                            item["pdf_link"] = full_link
+                        else:
+                            item["link"] = full_link
+                if item.get("link") or item.get("pdf_link"):
+                    links.append(item)
+            return links, url
+        except requests.RequestException as e:
+            logging.error(f"Failed to process page {page_number}: {e}")
+        return [], None
+    
+    def main(self):
+        categories = {
+            "recent-ecu": "https://www.bbc.co.uk/contact/recent-ecu?page={}",
+        }
+        for category_name, base_url in categories.items():
+            page_number = 0
+            while True:
+                items, url_html = self.process_page(page_number, base_url, category_name)
+                if not items:
+                    break
+                for item in items:
+                    self.process_item(item, url_html, category_name)
+                page_number += 1
+
 
 if __name__ == "__main__":
-    main()
+    scraper = BBCComplaintScraper()
+    scraper.main()
