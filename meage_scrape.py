@@ -1,4 +1,5 @@
 import asyncio
+from asyncio import subprocess
 from collections import defaultdict
 import os
 import logging
@@ -7,6 +8,7 @@ import json
 import random
 import socket
 import ssl
+import tempfile
 import time
 from urllib.parse import urljoin, urlparse, urlunparse, quote, unquote
 
@@ -30,9 +32,32 @@ from utils.BackedURLQueue import BackedURLQueue, URLItem
 import utils.keywords_finder as kw_finder
 from utils.ovarit import ovarit_domain_scrape
 from utils.reddit import reddit_domain_scrape
-from javascript import require
+# from javascript import require
 
-processArticle = require("./utils/ProcessArticle.js")
+
+
+async def process_article(html, url):
+    try:
+        # Run the JavaScript code asynchronously with Node.js
+        process = await asyncio.create_subprocess_exec(
+            "node", "utils/ProcessArticle.js", url,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        # Send the HTML content via stdin and close stdin
+        stdout, stderr = await process.communicate(input=html.encode('utf-8'))
+
+        if process.returncode == 0:
+            article = json.loads(stdout.decode('utf-8'))  # Parse the output as JSON
+            return article
+        else:
+            print(f"Error: {stderr.decode('utf-8')}")
+            return None
+    except Exception as e:
+        print(f"Exception occurred: {e}")
+        return None
 
 # Initialize logging
 logging.basicConfig(
@@ -314,23 +339,22 @@ class KeyPhraseFocusCrawler:
             metadata = await self.extract_metadata(bs, text, url_item.url, metadata)
             content_to_score = bs.get_text(separator=" ")
             lang = "unknown"  # Default if not found
+            try:
+                db_cat = await process_article(text, url_item.url)
+                # Check if 'content' and 'lang' keys exist in the returned dictionary
+                if db_cat and 'content' in db_cat and db_cat['content']:
+                    content_to_score = db_cat['content']
+                else:
+                    content_to_score = text
+                if db_cat and 'lang' in db_cat and db_cat['lang']:
+                    lang = db_cat['lang']
+                else:
+                    lang = None  # Set default if lang is missing or empty
+            except Exception as e:
+                logger.error(f"Error in processArticle for {url_item.url}: {e}")
+                content_to_score = text
+                lang = None  # Set default in case of exception
 
-            # Process the article content with the external processArticle module
-            for r in range(10):
-                async with self.lock:
-                    try:
-                        db_cat = processArticle.ProcessArticle(text, url_item.url)
-                        if db_cat and hasattr(db_cat, 'content') and db_cat.content:
-                            content_to_score = db_cat.content
-                        else:
-                            content_to_score = text
-                        if db_cat and hasattr(db_cat, 'lang') and db_cat.lang:
-                            lang = db_cat.lang
-                        break
-                    except Exception as e:
-                        logger.error(f"Error in processArticle for {url_item.url}: {e}")
-                        content_to_score = text
-                    continue
             # Extract text, compute score, and find keywords
             try:
                 bs_content = await loop.run_in_executor(
