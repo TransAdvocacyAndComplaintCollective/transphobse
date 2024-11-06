@@ -152,6 +152,7 @@ class KeyPhraseFocusCrawler:
         self.exclude_lag = exclude_lag or []
         self.exclude_subdirs_cruel = exclude_subdirs_cruel or []
         self.csv_rows = []  # For batching CSV writes
+        self.lock = asyncio.Lock()
 
     async def initialize_db(self):
         """Initialize the database and required tables."""
@@ -315,16 +316,17 @@ class KeyPhraseFocusCrawler:
             lang = "unknown"  # Default if not found
 
             # Process the article content with the external processArticle module
-            try:
-                db_cat = processArticle.ProcessArticle(text, url_item.url)
-                if db_cat and hasattr(db_cat, 'content') and db_cat.content:
-                    content_to_score = db_cat.content
-                else:
+            async with self.lock:
+                try:
+                    db_cat = processArticle.ProcessArticle(text, url_item.url)
+                    if db_cat and hasattr(db_cat, 'content') and db_cat.content:
+                        content_to_score = db_cat.content
+                    else:
+                        content_to_score = text
+                    lang = db_cat.lang if db_cat and db_cat.lang else bs.html.get("lang", "unknown")
+                except Exception as e:
+                    logger.error(f"Error in processArticle for {url_item.url}: {e}")
                     content_to_score = text
-                lang = db_cat.lang if db_cat and db_cat.lang else bs.html.get("lang", "unknown")
-            except Exception as e:
-                logger.error(f"Error in processArticle for {url_item.url}: {e}")
-                content_to_score = text
 
             # Extract text, compute score, and find keywords
             try:
