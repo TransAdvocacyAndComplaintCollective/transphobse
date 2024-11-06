@@ -316,18 +316,21 @@ class KeyPhraseFocusCrawler:
             lang = "unknown"  # Default if not found
 
             # Process the article content with the external processArticle module
-            async with self.lock:
-                try:
-                    db_cat = processArticle.ProcessArticle(text, url_item.url)
-                    if db_cat and hasattr(db_cat, 'content') and db_cat.content:
-                        content_to_score = db_cat.content
-                    else:
+            for r in range(10):
+                async with self.lock:
+                    try:
+                        db_cat = processArticle.ProcessArticle(text, url_item.url)
+                        if db_cat and hasattr(db_cat, 'content') and db_cat.content:
+                            content_to_score = db_cat.content
+                        else:
+                            content_to_score = text
+                        if db_cat and hasattr(db_cat, 'lang') and db_cat.lang:
+                            lang = db_cat.lang
+                        break
+                    except Exception as e:
+                        logger.error(f"Error in processArticle for {url_item.url}: {e}")
                         content_to_score = text
-                    lang = db_cat.lang if db_cat and db_cat.lang else bs.html.get("lang", "unknown")
-                except Exception as e:
-                    logger.error(f"Error in processArticle for {url_item.url}: {e}")
-                    content_to_score = text
-
+                    continue
             # Extract text, compute score, and find keywords
             try:
                 bs_content = await loop.run_in_executor(
