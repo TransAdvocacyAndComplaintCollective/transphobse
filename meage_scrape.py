@@ -23,6 +23,7 @@ import tqdm
 
 # Local imports
 from ffffff import lookup_keyword
+from utils.RL import ConfigManager
 from utils.bbc_scripe_cdx import get_all_urls_cdx
 from utils.duckduckgo import lookup_duckduckgos
 import utils.keywords as kw
@@ -157,6 +158,7 @@ class KeyPhraseFocusCrawler:
         exclude_lag=None,
         exclude_subdirs_cruel=None,
     ):
+        self.config_manager = ConfigManager(f"config_{name}.json")
         self.start_urls = start_urls
         self.feeds = feeds
         self.name = name
@@ -166,8 +168,10 @@ class KeyPhraseFocusCrawler:
         self.plugins = plugins
         self.output_csv = f"data/{name}.csv"
         self.file_db = f"databases/{name}.db"
-        self.semaphore = asyncio.Semaphore(max_limit)
-        self.thread_pool = ThreadPoolExecutor(max_workers=10)
+        self.max_limit = self.config_manager.get_value("max_limit", default=100, type=int, min_value=1, max_value=9000)
+        self.max_workers = self.config_manager.get_value("max_workers", default=100, type=int, min_value=1, max_value=9000)
+        self.semaphore = asyncio.Semaphore(self.max_limit)
+        self.thread_pool = ThreadPoolExecutor(max_workers=self.max_workers)
         self.conn = None
         self.robots = None
         self.urls_to_visit = None
@@ -178,6 +182,7 @@ class KeyPhraseFocusCrawler:
         self.exclude_subdirs_cruel = exclude_subdirs_cruel or []
         self.csv_rows = []  # For batching CSV writes
         self.lock = asyncio.Lock()
+        self.has_internet_error = False
 
     async def initialize_db(self):
         """Initialize the database and required tables."""
@@ -276,6 +281,7 @@ class KeyPhraseFocusCrawler:
         ssl_context = ssl.create_default_context(cafile=certifi.where())
         retries = 5
         attempt = 0
+        backoff_base = 2  # Base for exponential backoff
         while attempt < retries:
             try:
                 async with session.get(
@@ -293,21 +299,35 @@ class KeyPhraseFocusCrawler:
                         return None, None
                     else:
                         logger.warning(
-                            f"Failed to fetch {url}, retrying... ({attempt + 1}/{retries})"
+                            f"Failed to fetch {url}, status code {response.status}, retrying... ({attempt + 1}/{retries})"
                         )
-                        attempt = attempt + 1
+                        attempt += 1
+                        await asyncio.sleep(backoff_base ** attempt + random.uniform(0, 1))
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                # Network-related exceptions
+                logger.error(
+                    f"Network error while fetching {url}: {e}, retrying... ({attempt + 1}/{retries})"
+                )
+                await asyncio.sleep(backoff_base ** attempt + random.uniform(0, 1))
+
+                # Check if internet connection is lost
+                if not await check_internet():
+                    self.has_internet_error= True
+                    logger.error(f"Internet connection lost while fetching {url}. Waiting for connection to be restored...")
+                    # Wait until the internet connection is restored
+                    while not await check_internet():
+                        await asyncio.sleep(5)  # Wait 5 seconds before checking again
+                    logger.info(f"Internet connection restored. Resuming fetch for {url}.")
+                else: # Internet connection is still active
+                    attempt += 1
             except Exception as e:
-                if await check_internet():
-                    attempt = attempt + 1
-                    logger.error(
-                        f"Error fetching {url}: {e}, retrying... ({attempt + 1}/{retries})"
-                    )
-                    await asyncio.sleep(2 ** attempt + random.random())
-                else:
-                    logger.error(f"Internet connection lost while fetching {url}")
+                logger.error(f"Unexpected error while fetching {url}: {e}")
+                break  # Exit the retry loop for unexpected exceptions
+
         await self.urls_to_visit.update_status(url, "error")
         logger.error(f"Max retries reached for {url}")
         return None, None
+
 
     async def process_content(self, url_item, text, mime):
         metadata = {}
@@ -326,60 +346,32 @@ class KeyPhraseFocusCrawler:
 
     async def analyze_webpage_content(self, text, url_item, metadata):
         loop = asyncio.get_event_loop()
-
         try:
-            # Use SoupStrainer with parse_only to limit parsing to necessary elements
-            bs = BeautifulSoup(text, "html.parser")
+            article = await process_article(text, url_item.url)
+            # Offload the entire content analysis to the thread pool
+            result = await loop.run_in_executor(
+                self.thread_pool,
+                self._analyze_webpage_content_sync,
+                text,
+                url_item,
+                metadata,
+                article
+            )
 
-            # Ensure bs is a BeautifulSoup object to avoid 'is_xml' issues
-            if not isinstance(bs, BeautifulSoup):
-                raise TypeError(f"Unexpected object type {type(bs)} for URL: {url_item.url}")
+            if result is None:
+                return
 
-            # Extract metadata for the current URL
-            metadata = await self.extract_metadata(bs, text, url_item.url, metadata)
-            content_to_score = bs.get_text(separator=" ")
-            lang = "unknown"  # Default if not found
-            try:
-                db_cat = await process_article(text, url_item.url)
-                # Check if 'content' and 'lang' keys exist in the returned dictionary
-                if db_cat and 'content' in db_cat and db_cat['content']:
-                    content_to_score = db_cat['content']
-                else:
-                    content_to_score = text
-                if db_cat and 'lang' in db_cat and db_cat['lang']:
-                    lang = db_cat['lang']
-                else:
-                    lang = None  # Set default if lang is missing or empty
-            except Exception as e:
-                logger.error(f"Error in processArticle for {url_item.url}: {e}")
-                content_to_score = text
-                lang = None  # Set default in case of exception
+            # Unpack the results
+            score, keywords, metadata, links_to_queue, canonical_url = result
 
-            # Extract text, compute score, and find keywords
-            try:
-                bs_content = await loop.run_in_executor(
-                    self.thread_pool, BeautifulSoup, content_to_score, "html.parser"
-                )
-                text_content = bs_content.get_text(separator=" ")
-                score, keywords, _ = self.keypaceFinder.relative_keywords_score(text_content)
-            except Exception as e:
-                logger.error(f"Error computing score for {url_item.url}: {e}")
-                score, keywords = 0, []
+            # Queue extracted links for further crawling
+            for link_info in links_to_queue:
+                await self._add_to_queue(*link_info)
 
-            # Extract and queue links for further crawling
-            await self.extract_and_queue_links(bs, url_item.url, score)
-
-            # Check the language and canonical URL before finalizing
-            if lang not in {"en_GB", "en_US"}:
-                for link in bs.find_all("link", rel=lambda x: x and "canonical" in x):
-                    canonical_href = link.get("href")
-                    if canonical_href:
-                        url_normalized_canonical = normalize_url(canonical_href)
-                        if url_item.url != url_normalized_canonical:
-                            await self._add_to_queue(
-                                url_normalized_canonical, "webpage", priority=score
-                            )
-                            return  # Exit processing for the original URL
+            # Check if we need to process the canonical URL instead
+            if canonical_url and url_item.url != canonical_url:
+                await self._add_to_queue(canonical_url, "webpage", priority=score)
+                return  # Exit processing for the original URL
 
             # If the score is positive, update the score and save to CSV
             if score > 0:
@@ -390,7 +382,55 @@ class KeyPhraseFocusCrawler:
             logger.error(f"Error in analyze_webpage_content for {url_item.url}: {e}")
             await self.urls_to_visit.update_error(url_item.url, str(e))
 
+    def _analyze_webpage_content_sync(self, text, url_item, metadata,article):
+        try:
+            bs = BeautifulSoup(text, "html.parser")
 
+            # Extract metadata
+            metadata = self.extract_metadata(bs, text, url_item.url, metadata)
+            if article is not None:
+                content_to_score = article.get('content', text)
+                lang = article.get('lang', 'unknown')
+            else:
+                content_to_score = bs.find("body").get_text(separator=" ")
+                try:
+                    lang = bs.html.get("lang", "unknown")
+                except:
+                    lang = "unknown"
+            # Compute score and find keywords
+            bs_content = BeautifulSoup(content_to_score, "html.parser")
+            text_content = bs_content.get_text(separator=" ")
+            score, keywords, _ = self.keypaceFinder.relative_keywords_score(text_content)
+
+            # Extract and prepare links to queue
+            links = set(a["href"] for a in bs.find_all("a", href=True))
+            links_to_queue = [
+                (urljoin(url_item.url, link), "webpage", score) for link in links
+            ]
+
+            # Check for canonical URL
+            canonical_url = None
+            if lang not in {"en_GB", "en_US"}:
+                for link in bs.find_all("link", rel=lambda x: x and "canonical" in x):
+                    canonical_href = link.get("href")
+                    if canonical_href:
+                        canonical_url = normalize_url(canonical_href)
+                        break
+
+            return score, keywords, metadata, links_to_queue, canonical_url
+        except Exception as e:
+            logger.error(f"Error in _analyze_webpage_content_sync: {e}")
+            return None
+
+
+    def _extract_canonical_links_sync(self, bs):
+        try:
+            canonical_links = bs.find_all("link", rel=lambda x: x and "canonical" in x)
+            return canonical_links
+        except Exception as e:
+            logger.error(f"Error extracting canonical links: {e}")
+            return []
+        
     async def process_feed(self, text, url):
         feed = feedparser.parse(text)
         for entry in feed.entries:
@@ -405,7 +445,7 @@ class KeyPhraseFocusCrawler:
         for link in urls:
             await self._add_to_queue(link, "webpage")
 
-    async def extract_metadata(self, bs, text, url, metadata={}):
+    def extract_metadata(self, bs, text, url, metadata={}):
         try:
             json_ld = self.extract_json_ld(bs)
             if json_ld and isinstance(json_ld, dict):  # Ensure json_ld is a dictionary
@@ -425,9 +465,9 @@ class KeyPhraseFocusCrawler:
                 if microdata and isinstance(microdata, dict):  # Ensure microdata is a dictionary
                     metadata.update(microdata)
         except Exception as e:
-            await self.urls_to_visit.update_error(
-                url, f"Metadata extraction failed: {e}"
-            )
+            # await self.urls_to_visit.update_error(
+            #     url, f"Metadata extraction failed: {e}"
+            # )
             logger.error(f"Failed to extract metadata for {url}: {e}")
         return metadata
 
@@ -488,10 +528,35 @@ class KeyPhraseFocusCrawler:
         return microdata_items
 
     async def extract_and_queue_links(self, bs, url, score):
-        links = set(a["href"] for a in bs.find_all("a", href=True))
+        loop = asyncio.get_event_loop()
+        # Extract and queue links for further crawling
+        links = await loop.run_in_executor(
+            self.thread_pool,
+            self._extract_links_sync,
+            bs
+        )
         for link in links:
             full_url = urljoin(url, link)
             await self._add_to_queue(full_url, "webpage", priority=score)
+    
+    def _analyze_content_sync(self, content_to_score):
+        try:
+            bs_content = BeautifulSoup(content_to_score, "html.parser")
+            text_content = bs_content.get_text(separator=" ")
+            score, keywords, _ = self.keypaceFinder.relative_keywords_score(text_content)
+            return text_content, score, keywords
+        except Exception as e:
+            logger.error(f"Error in _analyze_content_sync: {e}")
+            return None
+        
+    def _extract_links_sync(self, bs):
+        try:
+            links = set(a["href"] for a in bs.find_all("a", href=True))
+            return links
+        except Exception as e:
+            logger.error(f"Error extracting links: {e}")
+            return set()
+
 
     def collect_csv_row(self, url_item, score, keywords, metadata):
         root_url = urlparse(url_item.url).netloc
@@ -536,34 +601,77 @@ class KeyPhraseFocusCrawler:
                 await self.urls_to_visit.mark_processing(url_item.url)
                 yield url_item
 
+
+    def adjust_parameters(self):
+        print("adjust_parameters")
+        """Adjust parameters based on updated Q-values."""
+        # Retrieve updated values for 'max_limit' and 'max_workers'
+        new_max_limit = self.config_manager.get_value(
+            "max_limit", default=self.max_limit, type=int, min_value=1, max_value=9000, policy="epsilon_greedy"
+        )
+        new_max_workers = self.config_manager.get_value(
+            "max_workers", default=self.max_workers, type=int, min_value=1, max_value=9000, policy="epsilon_greedy"
+        )
+
+        # Update semaphore and thread pool if values have changed
+        if new_max_limit != self.max_limit:
+            self.max_limit = new_max_limit
+            self.semaphore = asyncio.Semaphore(self.max_limit)
+            logger.info(f"Updated max_limit to {self.max_limit}")
+
+        if new_max_workers != self.max_workers:
+            self.max_workers = new_max_workers
+            self.thread_pool = ThreadPoolExecutor(max_workers=self.max_workers)
+            logger.info(f"Updated max_workers to {self.max_workers}")
+
     async def _crawl_loop(self, session):
         loop = asyncio.get_event_loop()
         max_count = await self.urls_to_visit.count_all()
         done_count = await self.urls_to_visit.count_seen()
+    
         with tqdm.tqdm(
             total=max_count, initial=done_count, desc="Crawling Progress", unit="url"
         ) as pbar:
             tasks = set()
-
+            start = time.time()  # Initialize start time for reward calculation
+            concurrent_task_limit = self.config_manager.get_value("concurrent_task_limit", default=100, type=int, min_value=1, max_value=900)
             async for url_item in self._url_generator():
                 max_count = await self.urls_to_visit.count_all()
                 pbar.total = max_count
-                task = loop.create_task(self.fetch_and_process_url(url_item, session))
+                task = loop.create_task(self.fetch_and_process_url(url_item, session,pbar))
                 tasks.add(task)
+    
+                # Limit the number of concurrent tasks based on semaphore
+                if len(tasks) >= concurrent_task_limit:
+                    done, _ = await asyncio.wait(tasks)
+                    
+                    # Calculate reward and update Q-learning step
+                    time_taken = time.time() - start
+                    if not self.has_internet_error:
+                        reward = len(done) / time_taken if time_taken > 0 else 0
+                        # Update ConfigManager with the reward and parameter names
+                        self.config_manager.step(["max_limit", "max_workers","concurrent_task_limit"], reward)
+                        self.config_manager.save_config()
 
-                if len(tasks) >= self.semaphore._value:
-                    _done, tasks = await asyncio.wait(
-                        tasks, return_when=asyncio.FIRST_COMPLETED
-                    )
+                        # Optionally, adjust the parameters based on new Q-values
+                        concurrent_task_limit = self.config_manager.get_value("concurrent_task_limit", default=100, type=int, min_value=1, max_value=900)
+                        self.adjust_parameters()
 
-                pbar.update(1)
+                    start = time.time()  # Reset start time for the next batch
 
+                        # Remove completed tasks from the set
+                    tasks.difference_update(done)
+    
+            # Wait for any remaining tasks to complete
             if tasks:
-                await asyncio.wait(tasks)
-
+                await asyncio.gather(*tasks)
+    
+            # Ensure the remaining CSV rows are written to the file
             self.write_to_csv()
 
-    async def fetch_and_process_url(self, url_item, session):
+
+
+    async def fetch_and_process_url(self, url_item, session,pbar):
         if not url_item:
             return
 
@@ -576,6 +684,8 @@ class KeyPhraseFocusCrawler:
                     logger.error(f"Empty content for {url_item.url}")
             except Exception as e:
                 logger.error(f"Error processing {url_item.url}: {e}")
+        
+        pbar.update(1)
 
     async def crawl_start(self):
         os.makedirs(os.path.dirname(self.file_db), exist_ok=True)

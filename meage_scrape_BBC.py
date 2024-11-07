@@ -3,6 +3,16 @@ import os
 from meage_scrape import KeyPhraseFocusCrawler
 import utils.keywords as kw
 
+import signal, os
+
+def handler(signum, frame):
+    print(f"Signal {signum} received")
+
+# Set the signal handler
+signal.signal(signal.SIGINT, handler)
+signal.signal(signal.SIGHUP, handler)
+
+
 async def main():
     if not os.path.exists("databaces"):
         os.mkdir("databaces")
