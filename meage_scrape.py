@@ -607,10 +607,10 @@ class KeyPhraseFocusCrawler:
         """Adjust parameters based on updated Q-values."""
         # Retrieve updated values for 'max_limit' and 'max_workers'
         new_max_limit = self.config_manager.get_value(
-            "max_limit", default=self.max_limit, type=int, min_value=1, max_value=9000, policy="epsilon_greedy"
+            "max_limit", default=self.max_limit, type=int, min_value=1, max_value=4000, policy="epsilon_greedy"
         )
         new_max_workers = self.config_manager.get_value(
-            "max_workers", default=self.max_workers, type=int, min_value=1, max_value=9000, policy="epsilon_greedy"
+            "max_workers", default=self.max_workers, type=int, min_value=1, max_value=4000, policy="epsilon_greedy"
         )
 
         # Update semaphore and thread pool if values have changed
@@ -634,7 +634,7 @@ class KeyPhraseFocusCrawler:
         ) as pbar:
             tasks = set()
             start = time.time()  # Initialize start time for reward calculation
-            concurrent_task_limit = self.config_manager.get_value("concurrent_task_limit", default=100, type=int, min_value=1, max_value=900)
+            concurrent_task_limit = self.config_manager.get_value("concurrent_task_limit", default=100, type=int, min_value=1, max_value=300)
             async for url_item in self._url_generator():
                 max_count = await self.urls_to_visit.count_all()
                 pbar.total = max_count
@@ -654,7 +654,7 @@ class KeyPhraseFocusCrawler:
                         self.config_manager.save_config()
 
                         # Optionally, adjust the parameters based on new Q-values
-                        concurrent_task_limit = self.config_manager.get_value("concurrent_task_limit", default=100, type=int, min_value=1, max_value=900)
+                        concurrent_task_limit = self.config_manager.get_value("concurrent_task_limit", default=100, type=int, min_value=1, max_value=300)
                         self.adjust_parameters()
 
                     start = time.time()  # Reset start time for the next batch
