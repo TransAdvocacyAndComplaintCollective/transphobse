@@ -38,13 +38,7 @@ from utils.reddit import reddit_domain_scrape
 # from javascript import require
 
 import logging
-def handler_SIGINT(signum, frame):
-    c = input("Do you really want to quit? (y/n) ")
-    if c == "y":
-        print(f"Signal {signum} received")
-        exit()
-    else:
-        print("Signal ignored")
+
 def handler_SIGHUP(signum, frame):
     print(f"Signal {signum} received")
 
