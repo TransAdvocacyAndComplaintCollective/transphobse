@@ -20,7 +20,7 @@ from bs4 import BeautifulSoup, SoupStrainer
 import feedparser
 import chardet
 from concurrent.futures import ThreadPoolExecutor
-from matplotlib import pyplot as plt
+from matplotlib import pyplot as pltplt
 import tqdm
 
 # Local imports
@@ -642,7 +642,7 @@ class Crawler:
 
 
     async def _crawl_loop(self, session):
-        draw_plot = True
+        draw_plot = False
         loop = asyncio.get_event_loop()
         max_count = await self.urls_to_visit.count_all()
         done_count = await self.urls_to_visit.count_seen()
