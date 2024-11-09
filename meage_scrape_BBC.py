@@ -1,16 +1,9 @@
 import asyncio
 import os
-from meage_scrape import KeyPhraseFocusCrawler
+from meage_scrape import Crawler
 import utils.keywords as kw
 
 import signal, os
-
-def handler(signum, frame):
-    print(f"Signal {signum} received")
-
-# Set the signal handler
-signal.signal(signal.SIGINT, handler)
-signal.signal(signal.SIGHUP, handler)
 
 
 async def main():
@@ -46,15 +39,15 @@ async def main():
 
     ]
     allowed_subdirs_cruel = ["https://bbc.co.uk/news/","https://feeds.bbci.co.uk/news"]
-    crawler = KeyPhraseFocusCrawler(
+    crawler = Crawler(
         start_urls,
         feeds,
         "BBC_news_mage_scrape",
-        allowed_subdirs_cruel=allowed_subdirs_cruel,
-        start_data=start_data,
-        end_data=end_data,
+        allowed_subdirs=allowed_subdirs_cruel,
+        start_date=start_data,
+        end_date=end_data,
         exclude_lag=exclude_lag,
-        exclude_subdirs_cruel=exclude_subdirs_cruel,
+        exclude_subdirs=exclude_subdirs_cruel,
     )
     # crawler.crawl_init()
 

@@ -1,6 +1,7 @@
 import asyncio
 from asyncio import subprocess
 from collections import defaultdict
+import multiprocessing
 import os
 import logging
 import csv
@@ -19,6 +20,7 @@ from bs4 import BeautifulSoup, SoupStrainer
 import feedparser
 import chardet
 from concurrent.futures import ThreadPoolExecutor
+from matplotlib import pyplot as plt
 import tqdm
 
 # Local imports
@@ -35,6 +37,19 @@ from utils.ovarit import ovarit_domain_scrape
 from utils.reddit import reddit_domain_scrape
 # from javascript import require
 
+import logging
+def handler_SIGINT(signum, frame):
+    c = input("Do you really want to quit? (y/n) ")
+    if c == "y":
+        print(f"Signal {signum} received")
+        exit()
+    else:
+        print("Signal ignored")
+def handler_SIGHUP(signum, frame):
+    print(f"Signal {signum} received")
+
+# log to file
+logging.basicConfig(filename='meage_scrape.log', level=logging.INFO)
 
 
 async def process_article(html, url):
@@ -108,7 +123,7 @@ async def check_internet(host="8.8.8.8", port=53, timeout=3):
 
 from urllib.parse import urlparse, urlunparse, quote, unquote
 
-def normalize_url(url: str) -> str:
+def normalize_url_format(url: str) -> str:
     """Standardize and clean URL format by enforcing https://, removing www prefix, 
     handling web.archive.org links, and ensuring consistent formatting of the path."""
     # Check and handle web.archive.org URLs
@@ -142,56 +157,58 @@ def normalize_url(url: str) -> str:
 
 
 
-class KeyPhraseFocusCrawler:
+class Crawler:
     def __init__(
-        self,
-        start_urls,
-        feeds,
-        name,
-        keywords=kw.KEYWORDS,
-        anti_keywords=kw.ANTI_KEYWORDS,
-        plugins=[],
-        max_limit=100,  # Adjusted for optimal concurrency
-        allowed_subdirs_cruel=None,
-        start_data=None,
-        end_data=None,
-        exclude_lag=None,
-        exclude_subdirs_cruel=None,
+            self,
+            start_urls,
+            feeds,
+            name,
+            keywords=kw.KEYWORDS,
+            anti_keywords=kw.ANTI_KEYWORDS,
+            plugins=[],
+            allowed_subdirs=None,
+            start_date=None,
+            end_date=None,
+            exclude_subdirs=None,
+            exclude_lag=[]
     ):
-        self.config_manager = ConfigManager(f"config_{name}.json")
+        self.config_manager = ConfigManager(f"data/config_{name}.json")
         self.start_urls = start_urls
         self.feeds = feeds
         self.name = name
         self.keywords = keywords
         self.anti_keywords = anti_keywords
-        self.keypaceFinder = kw_finder.KeypaceFinder(keywords)
+        self.key_finder = kw_finder.KeypaceFinder(keywords)
         self.plugins = plugins
         self.output_csv = f"data/{name}.csv"
         self.file_db = f"databases/{name}.db"
-        self.max_limit = self.config_manager.get_value("max_limit", default=100, type=int, min_value=1, max_value=9000)
-        self.max_workers = self.config_manager.get_value("max_workers", default=100, type=int, min_value=1, max_value=9000)
-        self.semaphore = asyncio.Semaphore(self.max_limit)
+        self.cpu_cores = multiprocessing.cpu_count()
+        self.max_limit = self.config_manager.get_value("max_limit", default=100, value_type=int, min_value=1,
+                                                       max_value=3000, policy="decay_epsilon_greedy")
+        self.max_workers = self.config_manager.get_value("max_workers", default=self.cpu_cores * 2, value_type=int,
+                                                         min_value=1, max_value=self.cpu_cores*4, policy="decay_epsilon_greedy")
+        self.bach_size = self.config_manager.get_value("bach_size", default=500, value_type=int,
+                                                         min_value=1, max_value=3000, policy="decay_epsilon_greedy")
+        self.semaphore = asyncio.Semaphore(self.bach_size)
         self.thread_pool = ThreadPoolExecutor(max_workers=self.max_workers)
         self.conn = None
         self.robots = None
         self.urls_to_visit = None
-        self.allowed_subdirs_cruel = allowed_subdirs_cruel or []
-        self.start_data = start_data
-        self.end_data = end_data
-        self.exclude_lag = exclude_lag or []
-        self.exclude_subdirs_cruel = exclude_subdirs_cruel or []
-        self.csv_rows = []  # For batching CSV writes
+        self.allowed_subdirs = allowed_subdirs or []
+        self.start_date = start_date
+        self.end_date = end_date
+        self.exclude_subdirs = exclude_subdirs or []
+        self.csv_rows = []
         self.lock = asyncio.Lock()
         self.has_internet_error = False
-
     async def initialize_db(self):
-        """Initialize the database and required tables."""
+        """Set up the database and required tables."""
         self.robots = RobotsSql(self.conn, self.thread_pool)
         self.urls_to_visit = BackedURLQueue(self.conn, table_name="urls_to_visit")
         await self.urls_to_visit.initialize()
         await self.robots.initialize()
 
-    def _initialize_output_csv(self):
+    def initialize_output_csv(self):
         os.makedirs(os.path.dirname(self.output_csv), exist_ok=True)
         fieldnames = [
             "Root Domain",
@@ -199,36 +216,28 @@ class KeyPhraseFocusCrawler:
             "Score",
             "Keywords Found",
             "Headline",
-            "name",
+            "Name",
             "Date Published",
             "Date Modified",
             "Author",
             "Byline",
-            "type",
-            "crawled at",
+            "Type",
+            "Crawled At",
         ]
         if not os.path.exists(self.output_csv) or os.path.getsize(self.output_csv) == 0:
-            with open(
-                self.output_csv, mode="w", newline="", buffering=1, encoding="utf-8"
-            ) as csv_file:
+            with open(self.output_csv, mode="w", newline="", encoding="utf-8") as csv_file:
                 csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
                 csv_writer.writeheader()
 
-    async def _initialize_urls(self):
+    async def initialize_urls(self):
         if await self.urls_to_visit.count_seen() > 0:
             logger.info("URLs have already been initialized.")
             return
 
-        # for url in self.start_urls:
-        #     await self._add_to_queue(url, "start", priority=0)
-        #     for new_url in self._scrape_related_domains(url):
-        #         await self._add_to_queue(new_url[0], "webpage", priority=new_url[1])
-
-
         for url in self.start_urls:
-            await self._add_to_queue(url, "webpage", priority=0)
+            await self.add_to_queue(url, "webpage", priority=0)
         for feed in self.feeds:
-            await self._add_to_queue(feed, "feed", priority=0)
+            await self.add_to_queue(feed, "feed", priority=0)
 
     def _scrape_related_domains(self, url):
         o = urlparse(url)
@@ -238,7 +247,7 @@ class KeyPhraseFocusCrawler:
             + list(get_all_urls_cdx(o.hostname))
         )
         return [
-            (link[0], self.keypaceFinder.relative_keywords_score(link[1])[0])
+            (link[0], self.key_finder.relative_keywords_score(link[1])[0])
             for link in scraped_urls
         ]
 
@@ -247,31 +256,49 @@ class KeyPhraseFocusCrawler:
             for keyword in self.keywords:
                 await lookup_keyword(keyword, url)
 
-    async def _add_to_queue(self, url, url_type, priority=0):
-        normalized_url = normalize_url(url)
+    async def add_to_queue(self, url, url_type, priority=0):
+        try:
+            # Normalize the URL first
+            normalized_url = normalize_url_format(url)
+    
+            # Validate URL and check if it has been seen before
+            if not self.is_valid_url(normalized_url):
+                return
+            if await self.urls_to_visit.have_been_seen(normalized_url):
+                return
+    
+            # Check allowed subdirectories and exclude subdirectories
+            if not any(
+                normalized_url.startswith(subdir) for subdir in self.allowed_subdirs
+            ):
+                return
+            if any(
+                normalized_url.startswith(subdir) for subdir in self.exclude_subdirs
+            ):
+                return
+    
+            # Check robots.txt rules
+            robot = await self.robots.get(normalized_url)
+            if robot and not robot.can_fetch("*", normalized_url):
+                return
+    
+            # Create a URL item and add it to the queue
+            url_item = URLItem(
+                url=normalized_url,
+                url_score=priority,
+                page_type=url_type,
+                status="unseen"
+            )
+            await self.urls_to_visit.push(url_item)
+    
+        except Exception as e:
+            # Log any errors encountered during queue addition
+            logger.error(f"Failed to add URL to queue: {url} - Error: {e}")
 
-        if (
-            not self.is_valid_url(normalized_url)
-            or await self.urls_to_visit.have_been_seen(normalized_url)
-        ):
-            return
-
-        if not any(
-            normalized_url.startswith(subdir) for subdir in self.allowed_subdirs_cruel
-        ) or any(
-            normalized_url.startswith(subdir) for subdir in self.exclude_subdirs_cruel
-        ):
-            return
-
-        robot = await self.robots.get(normalized_url)
-        if robot and not robot.can_fetch("*", normalized_url):
-            return
-
-        url_item = URLItem(
-            url=normalized_url, url_score=priority, page_type=url_type, status="unseen"
-        )
-        await self.urls_to_visit.push(url_item)
-
+    def is_valid_url(self, url):
+        parsed = urlparse(url)
+        return all([parsed.scheme, parsed.netloc])
+    
     def is_valid_url(self, url):
         parsed = urlparse(url)
         return all([parsed.scheme, parsed.netloc])
@@ -366,11 +393,11 @@ class KeyPhraseFocusCrawler:
 
             # Queue extracted links for further crawling
             for link_info in links_to_queue:
-                await self._add_to_queue(*link_info)
+                await self.add_to_queue(*link_info)
 
             # Check if we need to process the canonical URL instead
             if canonical_url and url_item.url != canonical_url:
-                await self._add_to_queue(canonical_url, "webpage", priority=score)
+                await self.add_to_queue(canonical_url, "webpage", priority=score)
                 return  # Exit processing for the original URL
 
             # If the score is positive, update the score and save to CSV
@@ -400,7 +427,7 @@ class KeyPhraseFocusCrawler:
             # Compute score and find keywords
             bs_content = BeautifulSoup(content_to_score, "html.parser")
             text_content = bs_content.get_text(separator=" ")
-            score, keywords, _ = self.keypaceFinder.relative_keywords_score(text_content)
+            score, keywords, _ = self.key_finder.relative_keywords_score(text_content)
 
             # Extract and prepare links to queue
             links = set(a["href"] for a in bs.find_all("a", href=True))
@@ -414,7 +441,7 @@ class KeyPhraseFocusCrawler:
                 for link in bs.find_all("link", rel=lambda x: x and "canonical" in x):
                     canonical_href = link.get("href")
                     if canonical_href:
-                        canonical_url = normalize_url(canonical_href)
+                        canonical_url = normalize_url_format(canonical_href)
                         break
 
             return score, keywords, metadata, links_to_queue, canonical_url
@@ -434,16 +461,16 @@ class KeyPhraseFocusCrawler:
     async def process_feed(self, text, url):
         feed = feedparser.parse(text)
         for entry in feed.entries:
-            score, keywords, _ = self.keypaceFinder.relative_keywords_score(
+            score, keywords, _ = self.key_finder.relative_keywords_score(
                 entry.title
             )
-            await self._add_to_queue(entry.link, "webpage", priority=score)
+            await self.add_to_queue(entry.link, "webpage", priority=score)
 
     async def process_sitemap(self, text, url):
         bs = BeautifulSoup(text, "html.parser")
         urls = [loc.text for loc in bs.find_all("loc")]
         for link in urls:
-            await self._add_to_queue(link, "webpage")
+            await self.add_to_queue(link, "webpage")
 
     def extract_metadata(self, bs, text, url, metadata={}):
         try:
@@ -537,13 +564,13 @@ class KeyPhraseFocusCrawler:
         )
         for link in links:
             full_url = urljoin(url, link)
-            await self._add_to_queue(full_url, "webpage", priority=score)
+            await self.add_to_queue(full_url, "webpage", priority=score)
     
     def _analyze_content_sync(self, content_to_score):
         try:
             bs_content = BeautifulSoup(content_to_score, "html.parser")
             text_content = bs_content.get_text(separator=" ")
-            score, keywords, _ = self.keypaceFinder.relative_keywords_score(text_content)
+            score, keywords, _ = self.key_finder.relative_keywords_score(text_content)
             return text_content, score, keywords
         except Exception as e:
             logger.error(f"Error in _analyze_content_sync: {e}")
@@ -606,68 +633,132 @@ class KeyPhraseFocusCrawler:
         print("adjust_parameters")
         """Adjust parameters based on updated Q-values."""
         # Retrieve updated values for 'max_limit' and 'max_workers'
-        new_max_limit = self.config_manager.get_value(
-            "max_limit", default=self.max_limit, type=int, min_value=1, max_value=4000, policy="epsilon_greedy"
-        )
-        new_max_workers = self.config_manager.get_value(
-            "max_workers", default=self.max_workers, type=int, min_value=1, max_value=4000, policy="epsilon_greedy"
+        
+        self.bach_size = self.config_manager.get_value("max_workers", default=500, value_type=int,
+                                                         min_value=1, max_value=3000, policy="decay_epsilon_greedy")
+        self.max_workers = self.config_manager.get_value(
+            "max_workers", default=self.cpu_cores*2, value_type=int, min_value=1, max_value=self.cpu_cores*4, policy="decay_epsilon_greedy"
         )
 
         # Update semaphore and thread pool if values have changed
-        if new_max_limit != self.max_limit:
-            self.max_limit = new_max_limit
-            self.semaphore = asyncio.Semaphore(self.max_limit)
-            logger.info(f"Updated max_limit to {self.max_limit}")
+        self.semaphore._value = self.bach_size
+        logger.info(f"Updated max_limit to {self.bach_size}")
+        self.thread_pool._max_workers = self.max_workers
+        logger.info(f"Updated max_workers to {self.max_workers}")
 
-        if new_max_workers != self.max_workers:
-            self.max_workers = new_max_workers
-            self.thread_pool = ThreadPoolExecutor(max_workers=self.max_workers)
-            logger.info(f"Updated max_workers to {self.max_workers}")
 
     async def _crawl_loop(self, session):
+        draw_plot = True
         loop = asyncio.get_event_loop()
         max_count = await self.urls_to_visit.count_all()
         done_count = await self.urls_to_visit.count_seen()
-    
+        await self.urls_to_visit.reload()
+
+        # Set up live plot with 4 lines
+        if draw_plot:
+            plt.ion()
+            fig, ax = plt.subplots()
+            ax.set_title("Task Parameters and Time Taken vs. Batch Number")
+            ax.set_xlabel("Batch Number")
+            ax.set_ylabel("Metrics")
+
+            max_limit_line, = ax.plot([], [], label="Max Limit", color="blue")
+            max_workers_line, = ax.plot([], [], label="Max Workers", color="green")
+            concurrent_limit_line, = ax.plot([], [], label="Concurrent Task Limit", color="purple")
+            rewards_line, = ax.plot([], [], label="rewards", color="pink")
+            time_line, = ax.plot([], [], label="Time Taken (seconds)", color="red")
+            ax.legend()
+
+        # Initialize lists to store plot data
+        batch_numbers = []
+        max_limit_data = []
+        max_workers_data = []
+        concurrent_limit_data = []
+        time_taken_data = []
+        rewards = []
         with tqdm.tqdm(
             total=max_count, initial=done_count, desc="Crawling Progress", unit="url"
         ) as pbar:
             tasks = set()
             start = time.time()  # Initialize start time for reward calculation
-            concurrent_task_limit = self.config_manager.get_value("concurrent_task_limit", default=100, type=int, min_value=1, max_value=300)
-            async for url_item in self._url_generator():
-                max_count = await self.urls_to_visit.count_all()
-                pbar.total = max_count
-                task = loop.create_task(self.fetch_and_process_url(url_item, session,pbar))
-                tasks.add(task)
-    
-                # Limit the number of concurrent tasks based on semaphore
-                if len(tasks) >= concurrent_task_limit:
-                    done, _ = await asyncio.wait(tasks)
-                    
-                    # Calculate reward and update Q-learning step
-                    time_taken = time.time() - start
-                    if not self.has_internet_error:
-                        reward = len(done) / time_taken if time_taken > 0 else 0
-                        # Update ConfigManager with the reward and parameter names
-                        self.config_manager.step(["max_limit", "max_workers","concurrent_task_limit"], reward)
-                        self.config_manager.save_config()
+            concurrent_task_limit = self.config_manager.get_value("concurrent_task_limit", default=100, value_type=int, min_value=1, max_value=1300, policy="decay_epsilon_greedy")
+            batch_number = 0
+            
+            bach_size = self.config_manager.get_value("bach_size", default=200, value_type=int, min_value=100, max_value=1300,policy="decay_epsilon_greedy")
+            max_workers = self.config_manager.get_value("max_workers", default=200, value_type=int, min_value=100, max_value=1300,policy="decay_epsilon_greedy")
+            concurrent_task_limit = self.config_manager.get_value("concurrent_task_limit", default=100, value_type=int, min_value=1, max_value=1300,policy="decay_epsilon_greedy")
+            
+            print("batch_number->",batch_number)
+            print("bach_size->",bach_size)
+            print("max_workers->",max_workers)
+            print("concurrent_task_limit->",concurrent_task_limit)
 
-                        # Optionally, adjust the parameters based on new Q-values
-                        concurrent_task_limit = self.config_manager.get_value("concurrent_task_limit", default=100, type=int, min_value=1, max_value=300)
-                        self.adjust_parameters()
+            while (await self.urls_to_visit.count_unseen()) or (await self.urls_to_visit.count_processing()):
+                async for url_item in self._url_generator():
+                    max_count = await self.urls_to_visit.count_all()
+                    pbar.total = max_count
+                    task = loop.create_task(self.fetch_and_process_url(url_item, session, pbar))
+                    tasks.add(task)
 
-                    start = time.time()  # Reset start time for the next batch
+                    if len(tasks) >= concurrent_task_limit:
+                        done, _ = await asyncio.wait(tasks)
 
-                        # Remove completed tasks from the set
-                    tasks.difference_update(done)
-    
-            # Wait for any remaining tasks to complete
-            if tasks:
-                await asyncio.gather(*tasks)
-    
-            # Ensure the remaining CSV rows are written to the file
-            self.write_to_csv()
+                        # Calculate reward and update Q-learning step
+                        time_taken = time.time() - start
+                        completed_tasks = len(done)
+
+                        if not self.has_internet_error:
+                            reward = completed_tasks / time_taken if time_taken > 0 else 0
+                            self.config_manager.step(["max_limit", "max_workers", "concurrent_task_limit"], reward)
+                            self.config_manager.save_config()
+
+                            # Retrieve new values from ConfigManager
+                            max_limit = self.config_manager.get_value("bach_size", default=100, value_type=int, min_value=50, max_value=300,policy="decay_epsilon_greedy")
+                            max_workers = self.config_manager.get_value("max_workers",default=min(self.cpu_cores//2,1), value_type=int, min_value=self.cpu_cores, max_value=self.cpu_cores*4,policy="decay_epsilon_greedy")
+                            concurrent_task_limit = self.config_manager.get_value("concurrent_task_limit", default=100, value_type=int, min_value=50, max_value=300,policy="decay_epsilon_greedy")
+                            
+                            print("batch_number->",batch_number)
+                            print("max_limit->",max_limit)
+                            print("max_workers->",max_workers)
+                            print("concurrent_task_limit->",concurrent_task_limit)
+                            print("reward->",reward)
+                            self.adjust_parameters()
+                            if draw_plot:
+                                # Update plot data
+                                batch_numbers.append(batch_number)
+                                rewards.append(reward)
+                                max_limit_data.append(max_limit)
+                                max_workers_data.append(max_workers)
+                                concurrent_limit_data.append(concurrent_task_limit)
+                                time_taken_data.append(time_taken)
+
+                                # Set data for each line
+                                max_limit_line.set_data(batch_numbers, max_limit_data)
+                                max_workers_line.set_data(batch_numbers, max_workers_data)
+                                concurrent_limit_line.set_data(batch_numbers, concurrent_limit_data)
+                                rewards_line.set_data(batch_numbers,rewards)
+                                time_line.set_data(batch_numbers, time_taken_data)
+
+                                # Update plot
+                                ax.relim()
+                                ax.autoscale_view()
+                                fig.canvas.draw()
+                                fig.canvas.flush_events()
+
+                            batch_number += 1
+
+                        # Reset start time for the next batch
+                        start = time.time()
+                        tasks.difference_update(done)
+
+                if tasks:
+                    await asyncio.gather(*tasks)
+
+                self.write_to_csv()
+        if draw_plot:
+            plt.ioff()  # Turn off interactive mode at the end
+            plt.show()  # Display the final plot
+
 
 
 
@@ -675,7 +766,8 @@ class KeyPhraseFocusCrawler:
         if not url_item:
             return
 
-        async with self.semaphore:
+        # async with self.semaphore:
+        if True:
             try:
                 text, mime = await self.fetch_content(session, url_item)
                 if text:
@@ -692,6 +784,6 @@ class KeyPhraseFocusCrawler:
         async with aiosqlite.connect(self.file_db) as self.conn:
             self.conn.row_factory = aiosqlite.Row
             await self.initialize_db()
-            self._initialize_output_csv()
-            await self._initialize_urls()
+            self.initialize_output_csv()
+            await self.initialize_urls()
             await self.crawl_main()

@@ -466,6 +466,19 @@ class BackedURLQueue:
         except aiosqlite.Error as e:
             logger.error(f"Failed to check if {url} has been seen: {e}")
             return False
+    
+    async def count_processing(self) -> int:
+        """Return the number of URLs that are currently being processed."""
+        try:
+            cursor = await self.conn.execute(
+                f"SELECT COUNT(*) FROM {self.table_name} WHERE status = 'processing'"
+            )
+            result = await cursor.fetchone()
+            await cursor.close()
+            return result[0] if result else 0
+        except aiosqlite.Error as e:
+            logger.error("Failed to count processing URLs: {e}")
+            return 0
 
     async def count_unseen(self) -> int:
         """Return the number of URLs that have not been seen yet."""
