@@ -20,7 +20,6 @@ from bs4 import BeautifulSoup, SoupStrainer
 import feedparser
 import chardet
 from concurrent.futures import ThreadPoolExecutor
-# from matplotlib import pyplot as pltplt
 import tqdm
 
 # Local imports
@@ -178,11 +177,11 @@ class Crawler:
         self.file_db = f"databases/{name}.db"
         self.cpu_cores = multiprocessing.cpu_count()
         self.max_limit = self.config_manager.get_value("max_limit", default=100, value_type=int, min_value=1,
-                                                       max_value=3000, policy="decay_epsilon_greedy")
+                                                       max_value=3000, policy="adaptive")
         self.max_workers = self.config_manager.get_value("max_workers", default=self.cpu_cores * 2, value_type=int,
-                                                         min_value=1, max_value=self.cpu_cores*4, policy="decay_epsilon_greedy")
+                                                         min_value=1, max_value=self.cpu_cores*4, policy="adaptive")
         self.bach_size = self.config_manager.get_value("bach_size", default=500, value_type=int,
-                                                         min_value=1, max_value=3000, policy="decay_epsilon_greedy")
+                                                         min_value=1, max_value=3000, policy="adaptive")
         self.semaphore = asyncio.Semaphore(self.bach_size)
         self.thread_pool = ThreadPoolExecutor(max_workers=self.max_workers)
         self.conn = None
@@ -629,9 +628,9 @@ class Crawler:
         # Retrieve updated values for 'max_limit' and 'max_workers'
         
         self.bach_size = self.config_manager.get_value("max_workers", default=500, value_type=int,
-                                                         min_value=1, max_value=3000, policy="decay_epsilon_greedy")
+                                                         min_value=1, max_value=3000, policy="adaptive")
         self.max_workers = self.config_manager.get_value(
-            "max_workers", default=self.cpu_cores*2, value_type=int, min_value=1, max_value=self.cpu_cores*4, policy="decay_epsilon_greedy"
+            "max_workers", default=self.cpu_cores*2, value_type=int, min_value=1, max_value=self.cpu_cores*4, policy="adaptive"
         )
 
         # Update semaphore and thread pool if values have changed
@@ -650,6 +649,7 @@ class Crawler:
 
         # Set up live plot with 4 lines
         if draw_plot:
+            from matplotlib import pyplot as plt
             plt.ion()
             fig, ax = plt.subplots()
             ax.set_title("Task Parameters and Time Taken vs. Batch Number")
@@ -675,12 +675,12 @@ class Crawler:
         ) as pbar:
             tasks = set()
             start = time.time()  # Initialize start time for reward calculation
-            concurrent_task_limit = self.config_manager.get_value("concurrent_task_limit", default=100, value_type=int, min_value=1, max_value=1300, policy="decay_epsilon_greedy")
+            concurrent_task_limit = self.config_manager.get_value("concurrent_task_limit", default=100, value_type=int, min_value=1, max_value=1300, policy="adaptive")
             batch_number = 0
             
-            bach_size = self.config_manager.get_value("bach_size", default=200, value_type=int, min_value=100, max_value=1300,policy="decay_epsilon_greedy")
-            max_workers = self.config_manager.get_value("max_workers", default=200, value_type=int, min_value=100, max_value=1300,policy="decay_epsilon_greedy")
-            concurrent_task_limit = self.config_manager.get_value("concurrent_task_limit", default=100, value_type=int, min_value=1, max_value=1300,policy="decay_epsilon_greedy")
+            bach_size = self.config_manager.get_value("bach_size", default=200, value_type=int, min_value=100, max_value=1300,policy="adaptive")
+            max_workers = self.config_manager.get_value("max_workers", default=200, value_type=int, min_value=100, max_value=1300,policy="adaptive")
+            concurrent_task_limit = self.config_manager.get_value("concurrent_task_limit", default=100, value_type=int, min_value=1, max_value=1300,policy="adaptive")
             
             print("batch_number->",batch_number)
             print("bach_size->",bach_size)
@@ -707,9 +707,9 @@ class Crawler:
                             self.config_manager.save_config()
 
                             # Retrieve new values from ConfigManager
-                            max_limit = self.config_manager.get_value("bach_size", default=100, value_type=int, min_value=50, max_value=300,policy="decay_epsilon_greedy")
-                            max_workers = self.config_manager.get_value("max_workers",default=min(self.cpu_cores//2,1), value_type=int, min_value=self.cpu_cores, max_value=self.cpu_cores*4,policy="decay_epsilon_greedy")
-                            concurrent_task_limit = self.config_manager.get_value("concurrent_task_limit", default=100, value_type=int, min_value=50, max_value=300,policy="decay_epsilon_greedy")
+                            max_limit = self.config_manager.get_value("bach_size", default=100, value_type=int, min_value=50, max_value=300,policy="adaptive")
+                            max_workers = self.config_manager.get_value("max_workers",default=min(self.cpu_cores//2,1), value_type=int, min_value=self.cpu_cores, max_value=self.cpu_cores*4,policy="adaptive")
+                            concurrent_task_limit = self.config_manager.get_value("concurrent_task_limit", default=100, value_type=int, min_value=50, max_value=300,policy="adaptive")
                             
                             print("batch_number->",batch_number)
                             print("max_limit->",max_limit)

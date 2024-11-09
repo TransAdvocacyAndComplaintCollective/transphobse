@@ -7,7 +7,7 @@ from itertools import product
 from typing import List
 
 class ConfigManager:
-    def __init__(self, config_file="config.json", learning_rate=0.1, discount_factor=0.9, initial_exploration_rate=1.0, exploration_decay=0.99, global_policy="epsilon_greedy"):
+    def __init__(self, config_file="config.json", learning_rate=0.1, discount_factor=0.9, initial_exploration_rate=1.0, exploration_decay=0.99, global_policy="adaptive"):
         self.config_file = config_file
         self.learning_rate = learning_rate
         self.discount_factor = discount_factor
@@ -30,7 +30,12 @@ class ConfigManager:
             "ucb": self.ucb_policy,
             "thompson_sampling": self.thompson_sampling_policy,
             "decay_epsilon_greedy": self.decay_epsilon_greedy_policy,
+            "lcb": self.lcb_policy,
         }
+
+        # Track policy performance for adaptive switching
+        self.policy_rewards = defaultdict(lambda: defaultdict(float))
+        self.policy_counts = defaultdict(lambda: defaultdict(int))
 
         # Load existing parameters or initialize
         self.parameters = self.load_config()
@@ -76,56 +81,50 @@ class ConfigManager:
         }
         self.value_types[name] = value_type
         self.value_ranges[name] = (min_value, max_value)
-
-        default_action = (default,)
-        self.q_values[name][default_action] = bias_init
+        self.q_values[name][(default,)] = bias_init
 
     def get_combined_action_space(self, parameter_names: List[str]):
-        if not isinstance(parameter_names, list) or not all(isinstance(name, str) for name in parameter_names):
-            raise TypeError("Expected parameter_names to be a list of strings")
-
         ranges = []
         for name in parameter_names:
             if name not in self.value_ranges:
                 self.initialize_parameter(name, int, 100, 1, 1000)
             min_value, max_value = self.value_ranges[name]
             ranges.append(range(min_value, max_value + 1))
-
         return list(product(*ranges))
 
-    def get_value(self, name, default=0, value_type=int, max_value=20, min_value=1, policy="epsilon_greedy"):
+    def get_value(self, name, default=0, value_type=int, max_value=20, min_value=1, policy="adaptive"):
         if name not in self.parameters:
             self.initialize_parameter(name, value_type, default, min_value, max_value)
 
+        if policy == "adaptive":
+            policy = self.meta_policy(name)
         policy_func = self.policy_functions.get(policy)
         if not policy_func:
-            raise ValueError(f"Unsupported policy '{policy}'. Available policies are: {list(self.policy_functions.keys())}")
+            raise ValueError(f"Unsupported policy '{policy}'")
 
         value = policy_func(name)[0]
         self.parameters[name]["value"] = value_type(value)
         return self.parameters[name]["value"]
 
-    def decay_epsilon_greedy_policy(self, parameter_name: str):
-        self.exploration_rates[parameter_name] *= self.exploration_decay
-        return self.epsilon_greedy_policy(parameter_name)
+    def meta_policy(self, parameter_name):
+        return max(self.policy_functions.keys(), key=lambda p: self.policy_rewards[parameter_name][p] / (self.policy_counts[parameter_name][p] + 1))
 
     def epsilon_greedy_policy(self, parameter_name: str):
         exploration_rate = self.exploration_rates[parameter_name]
         action_space = self.get_combined_action_space([parameter_name])
-        if random.random() < exploration_rate or not self.q_values[parameter_name]:
-            action = random.choice(action_space)
-        else:
-            filtered_q_values = {action: self.q_values[parameter_name][action] for action in action_space if action in self.q_values[parameter_name]}
-            action = random.choice(action_space) if not filtered_q_values else min(filtered_q_values, key=filtered_q_values.get)
-        return action
+        if random.random() < exploration_rate:
+            return random.choice(action_space)
+        filtered_q_values = {action: self.q_values[parameter_name][action] for action in action_space if action in self.q_values[parameter_name]}
+        return min(filtered_q_values, key=filtered_q_values.get)
+
+    def decay_epsilon_greedy_policy(self, parameter_name: str):
+        self.exploration_rates[parameter_name] *= self.exploration_decay
+        return self.epsilon_greedy_policy(parameter_name)
 
     def softmax_policy(self, parameter_name: str):
-        exploration_rate = self.exploration_rates[parameter_name]
         action_space = self.get_combined_action_space([parameter_name])
-        exp_values = {action: math.exp(-self.q_values[parameter_name].get(action, 0) / exploration_rate) for action in action_space}
+        exp_values = {action: math.exp(-self.q_values[parameter_name].get(action, 0)) for action in action_space}
         total = sum(exp_values.values())
-        if total == 0:
-            return random.choice(action_space)
         probabilities = {action: val / total for action, val in exp_values.items()}
         actions, probs = zip(*probabilities.items())
         return random.choices(actions, probs)[0]
@@ -134,57 +133,44 @@ class ConfigManager:
         total_count = self.total_counts[parameter_name] + 1
         ucb_values = {}
         action_space = self.get_combined_action_space([parameter_name])
-
         for action in action_space:
             count = self.action_counts[parameter_name][action] + 1
             q_value = self.q_values[parameter_name].get(action, 0)
             bonus = math.sqrt((2 * math.log(total_count)) / count)
             ucb_values[action] = -q_value + bonus
+        return max(ucb_values, key=ucb_values.get)
 
-        selected_action = max(ucb_values, key=ucb_values.get)
-        self.action_counts[parameter_name][selected_action] += 1
-        self.total_counts[parameter_name] += 1
-        return selected_action
+    def lcb_policy(self, parameter_name: str):
+        total_count = self.total_counts[parameter_name] + 1
+        lcb_values = {}
+        action_space = self.get_combined_action_space([parameter_name])
+        for action in action_space:
+            count = self.action_counts[parameter_name][action] + 1
+            q_value = self.q_values[parameter_name].get(action, 0)
+            confidence_term = math.sqrt((2 * math.log(total_count)) / count)
+            lcb_values[action] = q_value - confidence_term
+        return max(lcb_values, key=lcb_values.get)
 
     def thompson_sampling_policy(self, parameter_name: str):
         action_space = self.get_combined_action_space([parameter_name])
-        beta_params = {}
-
-        for action in action_space:
-            alpha = max(1, 1 + self.q_values[parameter_name].get(action, 0))
-            beta = max(1, 1 + self.action_counts[parameter_name][action] - self.q_values[parameter_name].get(action, 0))
-            beta_params[action] = (alpha, beta)
-
-        sampled_values = {action: np.random.beta(alpha, beta) for action, (alpha, beta) in beta_params.items()}
-        selected_action = max(sampled_values, key=sampled_values.get)
-        self.action_counts[parameter_name][selected_action] += 1
-        return selected_action
+        sampled_values = {action: np.random.beta(1 + self.q_values[parameter_name].get(action, 0), 1 + self.action_counts[parameter_name][action]) for action in action_space}
+        return max(sampled_values, key=sampled_values.get)
 
     def step(self, parameter_names: List[str], reward):
         for parameter_name in parameter_names:
-            policy_func = self.policy_functions.get(self.global_policy)
-            if not policy_func:
-                raise ValueError(f"Unsupported global policy '{self.global_policy}'. Available policies are: {list(self.policy_functions.keys())}")
-
-            # Select an action for each parameter individually
-            selected_action = policy_func(parameter_name)
+            policy = self.meta_policy(parameter_name) if self.global_policy == "adaptive" else self.global_policy
+            selected_action = self.policy_functions[policy](parameter_name)
             q_values = self.q_values[parameter_name]
 
             if selected_action not in q_values:
                 q_values[selected_action] = 0
 
-            best_next_value = max(
-                [q_values.get(action, 0) for action in q_values if action != selected_action],
-                default=0
-            )
+            best_next_value = max(q_values.values(), default=0)
             old_value = q_values[selected_action]
+            q_values[selected_action] += self.learning_rate * (reward + self.discount_factor * best_next_value - old_value)
 
-            # Update Q-value with the learning rate and discount factor
-            q_values[selected_action] += self.learning_rate * (
-                reward + self.discount_factor * best_next_value - old_value
-            )
-
-            # Decay exploration rate for this parameter after each step
+            self.policy_rewards[parameter_name][policy] += reward
+            self.policy_counts[parameter_name][policy] += 1
             self.exploration_rates[parameter_name] *= self.exploration_decay
 
     def reset(self):
@@ -192,4 +178,6 @@ class ConfigManager:
         self.exploration_rates = defaultdict(lambda: self.initial_exploration_rate)
         self.total_counts = defaultdict(int)
         self.action_counts.clear()
+        self.policy_rewards.clear()
+        self.policy_counts.clear()
         self.save_config()
