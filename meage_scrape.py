@@ -20,7 +20,7 @@ from bs4 import BeautifulSoup, SoupStrainer
 import feedparser
 import chardet
 from concurrent.futures import ThreadPoolExecutor
-from matplotlib import pyplot as pltplt
+# from matplotlib import pyplot as pltplt
 import tqdm
 
 # Local imports
