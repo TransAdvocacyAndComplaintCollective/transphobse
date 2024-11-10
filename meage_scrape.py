@@ -785,7 +785,7 @@ class Crawler:
             pbar.update(completed_tasks)
         return completed_tasks
 
-    async def _crawl_loop(self, session,plot = True):
+    async def _crawl_loop(self, session,plot = False):
         """Main loop for crawling with adaptive Q-learning and live plotting."""
         if await self.urls_to_visit.empty():
             logger.info("No URLs left to visit. Exiting crawl loop.")
