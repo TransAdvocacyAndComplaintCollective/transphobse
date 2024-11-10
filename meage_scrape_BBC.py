@@ -48,7 +48,7 @@ async def main():
         end_date=end_data,
         exclude_lag=exclude_lag,
         exclude_subdirs=exclude_subdirs_cruel,
-        exclude_subdirs_scrape=exclude_subdirs_scrape
+        exclude_scrape_subdirs=exclude_subdirs_scrape
     )
     # crawler.crawl_init()
 
