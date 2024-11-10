@@ -305,12 +305,12 @@ def fetch_wayback(url_pattern: str, max_retries: int = 2, backoff_factor: int = 
 
     logging.info("Completed fetching Wayback Machine URLs.")
 
-try:
-    response = requests.get("https://index.commoncrawl.org/collinfo.json", timeout=100)
-    response.raise_for_status()
-    cc_cdxs = response.json()
-except requests.RequestException as e:
-    logging.error(f"Error fetching Common Crawl indexes: {e}")
+# try:
+#     response = requests.get("https://index.commoncrawl.org/collinfo.json", timeout=100)
+#     response.raise_for_status()
+#     cc_cdxs = response.json()
+# except requests.RequestException as e:
+#     logging.error(f"Error fetching Common Crawl indexes: {e}")
 
 # Progress bars added to fetch_commoncrawl
 def fetch_commoncrawl(

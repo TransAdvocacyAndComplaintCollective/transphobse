@@ -1,6 +1,7 @@
 import asyncio
 from asyncio import subprocess
 from collections import defaultdict
+import math
 import multiprocessing
 import os
 import logging
@@ -9,24 +10,22 @@ import json
 import random
 import socket
 import ssl
-import tempfile
 import time
 from urllib.parse import urljoin, urlparse, urlunparse, quote, unquote
 
 import aiohttp
 import aiosqlite
 import certifi
-from bs4 import BeautifulSoup, SoupStrainer
+from bs4 import BeautifulSoup
 import feedparser
 import chardet
 from concurrent.futures import ThreadPoolExecutor
 import tqdm
 
 # Local imports
-from ffffff import lookup_keyword
+from keyword_search import lookup_keyword
 from utils.RL import ConfigManager
 from utils.bbc_scripe_cdx import get_all_urls_cdx
-from utils.duckduckgo import lookup_duckduckgos
 import utils.keywords as kw
 from utils.RobotsSql import RobotsSql
 from utils.SQLDictClass import SQLDictClass
@@ -163,6 +162,7 @@ class Crawler:
             start_date=None,
             end_date=None,
             exclude_subdirs=None,
+            exclude_scrape_subdirs=None,
             exclude_lag=[]
     ):
         self.config_manager = ConfigManager(f"data/config_{name}.json")
@@ -177,9 +177,11 @@ class Crawler:
         self.file_db = f"databases/{name}.db"
         self.cpu_cores = multiprocessing.cpu_count()
         self.max_limit = self.config_manager.get_value("max_limit", default=100, value_type=int, min_value=1,
-                                                       max_value=3000, policy="adaptive")
+                                                       max_value=1500, policy="adaptive")
         self.max_workers = self.config_manager.get_value("max_workers", default=self.cpu_cores * 2, value_type=int,
                                                          min_value=1, max_value=self.cpu_cores*4, policy="adaptive")
+        self.max_workers = self.config_manager.get_value("max_workers",default=min(self.cpu_cores//2,1), value_type=int, min_value=self.cpu_cores, max_value=self.cpu_cores*4,policy="adaptive")
+
         self.bach_size = self.config_manager.get_value("bach_size", default=500, value_type=int,
                                                          min_value=1, max_value=3000, policy="adaptive")
         self.semaphore = asyncio.Semaphore(self.bach_size)
@@ -190,10 +192,69 @@ class Crawler:
         self.allowed_subdirs = allowed_subdirs or []
         self.start_date = start_date
         self.end_date = end_date
+        self.exclude_scrape_subdirs = exclude_scrape_subdirs or []
         self.exclude_subdirs = exclude_subdirs or []
         self.csv_rows = []
         self.lock = asyncio.Lock()
         self.has_internet_error = False
+        
+        self.batch_numbers  = []
+        self.rewards  = []
+        self.batch_size_data  = []
+        self.max_workers_data  = []
+        self.concurrent_limit_data  = []
+        self.time_taken_data  = []
+        self.total_discovered_links = 0
+        
+        
+        #  attributes for estimation
+        self.total_discovered_links = 0
+        self.average_links_per_page = 10  # Starting estimate
+        self.filtering_factor = 0.8  # Assumes we skip/filter 20% of pages
+        self.estimated_total_pages = 1000  # Initial rough estimate
+        self.growth_rate = 0.1  # Growth rate for logistic model
+        self.midpoint_batch = 5  # Midpoint for logistic growth
+        self.discovery_rate = []  # List to store the discovery rate (links found per batch)
+        self.exponential_phase = True  # Start in exponential growth phase
+        
+
+    def update_estimated_total_pages(self, batch_number):
+        """
+        Update the estimated total number of pages using a combined exponential and logistic growth model.
+        """
+        current_links = self.total_discovered_links
+
+        if self.exponential_phase:
+            # Exponential growth model
+            estimated_total = current_links * math.exp(self.growth_rate * batch_number)
+
+            # Check if we need to switch to logistic growth phase
+            if len(self.discovery_rate) >= 5:
+                recent_rate = sum(self.discovery_rate[-5:]) / 5
+                overall_rate = sum(self.discovery_rate) / len(self.discovery_rate)
+                if recent_rate < 0.8 * overall_rate:
+                    self.exponential_phase = False
+                    logger.info("Switching to logistic growth phase for estimation.")
+        else:
+            # Logistic growth model
+            L = self.estimated_total_pages
+            k = self.growth_rate
+            t = batch_number
+            t0 = self.midpoint_batch
+            estimated_total = L / (1 + math.exp(-k * (t - t0)))
+
+        # Update the estimate
+        self.estimated_total_pages = round(max(self.estimated_total_pages, estimated_total))
+
+    def update_discovery_rate(self, extracted_links_count):
+        """
+        Update the discovery rate based on the number of extracted links.
+        """
+        self.discovery_rate.append(extracted_links_count)
+        if len(self.discovery_rate) > 10:
+            # Limit the size of the discovery rate history to avoid memory issues
+            self.discovery_rate.pop(0)
+    
     async def initialize_db(self):
         """Set up the database and required tables."""
         self.robots = RobotsSql(self.conn, self.thread_pool)
@@ -251,31 +312,22 @@ class Crawler:
 
     async def add_to_queue(self, url, url_type, priority=0):
         try:
-            # Normalize the URL first
             normalized_url = normalize_url_format(url)
-    
-            # Validate URL and check if it has been seen before
+
             if not self.is_valid_url(normalized_url):
                 return
             if await self.urls_to_visit.have_been_seen(normalized_url):
                 return
-    
-            # Check allowed subdirectories and exclude subdirectories
-            if not any(
-                normalized_url.startswith(subdir) for subdir in self.allowed_subdirs
-            ):
+
+            if not any(normalized_url.startswith(subdir) for subdir in self.allowed_subdirs):
                 return
-            if any(
-                normalized_url.startswith(subdir) for subdir in self.exclude_subdirs
-            ):
+            if any(normalized_url.startswith(subdir) for subdir in self.exclude_subdirs):
                 return
-    
-            # Check robots.txt rules
+
             robot = await self.robots.get(normalized_url)
             if robot and not robot.can_fetch("*", normalized_url):
                 return
-    
-            # Create a URL item and add it to the queue
+
             url_item = URLItem(
                 url=normalized_url,
                 url_score=priority,
@@ -283,14 +335,15 @@ class Crawler:
                 status="unseen"
             )
             await self.urls_to_visit.push(url_item)
-    
+
+            # Update the estimate dynamically
+            self.total_discovered_links += 1
+            self.estimated_total_pages = self.total_discovered_links * self.average_links_per_page * self.filtering_factor
+
         except Exception as e:
-            # Log any errors encountered during queue addition
             logger.error(f"Failed to add URL to queue: {url} - Error: {e}")
 
-    def is_valid_url(self, url):
-        parsed = urlparse(url)
-        return all([parsed.scheme, parsed.netloc])
+
     
     def is_valid_url(self, url):
         parsed = urlparse(url)
@@ -364,11 +417,27 @@ class Crawler:
             )
             logger.warning(f"Unsupported MIME type for {url_item.url}: {mime}")
 
+        
+    def update_discovery_metrics(self, links_to_queue):
+        """
+        Update the total discovered links and the average number of links per page.
+        """
+        extracted_links_count = len(links_to_queue)
+        self.total_discovered_links += extracted_links_count
+    
+        # Update the average number of links per page
+        if self.total_discovered_links > 0:
+            self.average_links_per_page = (
+                (self.average_links_per_page + extracted_links_count) / 2
+            )
+
     async def analyze_webpage_content(self, text, url_item, metadata):
         loop = asyncio.get_event_loop()
         try:
+            if any(url_item.url.startswith(subdir) for subdir in self.exclude_scrape_subdirs):
+                return
+            
             article = await process_article(text, url_item.url)
-            # Offload the entire content analysis to the thread pool
             result = await loop.run_in_executor(
                 self.thread_pool,
                 self._analyze_webpage_content_sync,
@@ -381,19 +450,24 @@ class Crawler:
             if result is None:
                 return
 
-            # Unpack the results
             score, keywords, metadata, links_to_queue, canonical_url = result
 
-            # Queue extracted links for further crawling
+            # Update link discovery metrics
+            self.update_discovery_metrics(links_to_queue)
+
+            # Update the estimated total number of pages
+            self.update_estimated_total_pages(batch_number=len(self.batch_numbers))
+
+            # Add discovered links to the queue
             for link_info in links_to_queue:
                 await self.add_to_queue(*link_info)
 
-            # Check if we need to process the canonical URL instead
+            
+            # Check for canonical URL and add to queue if different
             if canonical_url and url_item.url != canonical_url:
                 await self.add_to_queue(canonical_url, "webpage", priority=score)
-                return  # Exit processing for the original URL
-
-            # If the score is positive, update the score and save to CSV
+                
+            # Update page score and collect CSV row if the score is positive
             if score > 0:
                 await self.urls_to_visit.set_page_score(url_item.url, score)
                 self.collect_csv_row(url_item, score, keywords, metadata)
@@ -401,6 +475,8 @@ class Crawler:
         except Exception as e:
             logger.error(f"Error in analyze_webpage_content for {url_item.url}: {e}")
             await self.urls_to_visit.update_error(url_item.url, str(e))
+
+
 
     def _analyze_webpage_content_sync(self, text, url_item, metadata,article):
         try:
@@ -627,7 +703,7 @@ class Crawler:
         """Adjust parameters based on updated Q-values."""
         # Retrieve updated values for 'max_limit' and 'max_workers'
         
-        self.bach_size = self.config_manager.get_value("max_workers", default=500, value_type=int,
+        self.bach_size = self.config_manager.get_value("bach_size", default=500, value_type=int,
                                                          min_value=1, max_value=3000, policy="adaptive")
         self.max_workers = self.config_manager.get_value(
             "max_workers", default=self.cpu_cores*2, value_type=int, min_value=1, max_value=self.cpu_cores*4, policy="adaptive"
@@ -638,121 +714,115 @@ class Crawler:
         logger.info(f"Updated max_limit to {self.bach_size}")
         self.thread_pool._max_workers = self.max_workers
         logger.info(f"Updated max_workers to {self.max_workers}")
+    
+    async def initialize_plot(self):
+        """Initialize the live plot for tracking progress and metrics."""
+        from matplotlib import pyplot as plt
+        plt.ion()
+        fig, ax = plt.subplots()
+        ax.set_title("Task Parameters and Time Taken vs. Batch Number")
+        ax.set_xlabel("Batch Number")
+        ax.set_ylabel("Metrics")
 
+        self.max_limit_line, = ax.plot([], [], label="Batch Size", color="blue")
+        self.max_workers_line, = ax.plot([], [], label="Max Workers", color="green")
+        self.concurrent_limit_line, = ax.plot([], [], label="Concurrent Task Limit", color="purple")
+        self.rewards_line, = ax.plot([], [], label="Rewards", color="pink")
+        self.time_line, = ax.plot([], [], label="Time Taken (seconds)", color="red")
+        ax.legend()
+        self.fig, self.ax = fig, ax
 
-    async def _crawl_loop(self, session):
-        draw_plot = False
-        loop = asyncio.get_event_loop()
-        max_count = await self.urls_to_visit.count_all()
-        done_count = await self.urls_to_visit.count_seen()
-        await self.urls_to_visit.reload()
+    async def log_parameters(self, batch_number, batch_size, max_workers, concurrent_task_limit):
+        """Log the current parameters for this batch."""
+        logger.info(f"Batch {batch_number}: batch_size={batch_size}, max_workers={max_workers}, "
+                    f"concurrent_task_limit={concurrent_task_limit}")
 
-        # Set up live plot with 4 lines
-        if draw_plot:
+    def update_plot_data(self, batch_number, reward, batch_size, max_workers, concurrent_task_limit, time_taken):
+        """Update the live plot data."""
+        self.batch_numbers.append(batch_number)
+        self.rewards.append(reward)
+        self.batch_size_data.append(batch_size)
+        self.max_workers_data.append(max_workers)
+        self.concurrent_limit_data.append(concurrent_task_limit)
+        self.time_taken_data.append(time_taken)
+
+        # Update lines with new data
+        self.max_limit_line.set_data(self.batch_numbers, self.batch_size_data)
+        self.max_workers_line.set_data(self.batch_numbers, self.max_workers_data)
+        self.concurrent_limit_line.set_data(self.batch_numbers, self.concurrent_limit_data)
+        self.rewards_line.set_data(self.batch_numbers, self.rewards)
+        self.time_line.set_data(self.batch_numbers, self.time_taken_data)
+
+        # Refresh plot
+        self.ax.relim()
+        self.ax.autoscale_view()
+        self.fig.canvas.draw()
+        self.fig.canvas.flush_events()
+
+    async def gather_tasks(self, session, tasks, concurrent_task_limit, pbar):
+        """Collect tasks up to the concurrency limit."""
+        async for url_item in self._url_generator():
+            task = asyncio.create_task(self.fetch_and_process_url(url_item, session, pbar))
+            tasks.add(task)
+            if len(tasks) >= concurrent_task_limit:
+                break
+        return tasks
+
+    async def update_q_learning(self, completed_tasks, time_taken):
+        """Calculate the reward and update Q-learning."""
+        reward = completed_tasks / time_taken if time_taken > 0 else 0
+        self.config_manager.step(["batch_size", "max_workers", "concurrent_task_limit"], reward)
+        self.config_manager.save_config()
+        self.adjust_parameters()
+        return reward
+
+    async def fetch_and_process(self, session, tasks, pbar):
+        """Fetch and process tasks, handling completed ones."""
+        if tasks:
+            done, _ = await asyncio.wait(tasks)
+            completed_tasks = len(done)
+            tasks.difference_update(done)
+            pbar.update(completed_tasks)
+        return completed_tasks
+
+    async def _crawl_loop(self, session,plot = True):
+        """Main loop for crawling with adaptive Q-learning and live plotting."""
+        if await self.urls_to_visit.empty():
+            logger.info("No URLs left to visit. Exiting crawl loop.")
+            return
+        if plot:
+            await self.initialize_plot()
+        start_time = time.time()
+        tasks = set()
+        batch_number = 0
+        pbar = tqdm.tqdm(total=max(await self.urls_to_visit.count_all(),self.estimated_total_pages), desc="Crawling Progress", unit="url")
+
+        while not await self.urls_to_visit.empty() or tasks:
+            concurrent_task_limit = self.config_manager.get_value("concurrent_task_limit", default=100, value_type=int)
+            batch_size = self.config_manager.get_value("batch_size", default=500, value_type=int)
+            max_workers = self.config_manager.get_value("max_workers", default=self.cpu_cores * 2, value_type=int)
+
+            await self.log_parameters(batch_number, batch_size, max_workers, concurrent_task_limit)
+
+            tasks = await self.gather_tasks(session, tasks, concurrent_task_limit, pbar)
+            completed_tasks = await self.fetch_and_process(session, tasks, pbar)
+
+            if completed_tasks > 0:
+                pbar.total = max(await self.urls_to_visit.count_all(),self.estimated_total_pages)
+                time_taken = time.time() - start_time
+                reward = await self.update_q_learning(completed_tasks, time_taken)
+                self.adjust_parameters()
+                self.config_manager.save_config()
+                if plot:
+                    self.update_plot_data(batch_number, reward, batch_size, max_workers, concurrent_task_limit, time_taken)
+
+                # Reset start time for next batch
+                start_time = time.time()
+                batch_number += 1
+        if plot:
             from matplotlib import pyplot as plt
-            plt.ion()
-            fig, ax = plt.subplots()
-            ax.set_title("Task Parameters and Time Taken vs. Batch Number")
-            ax.set_xlabel("Batch Number")
-            ax.set_ylabel("Metrics")
-
-            max_limit_line, = ax.plot([], [], label="Max Limit", color="blue")
-            max_workers_line, = ax.plot([], [], label="Max Workers", color="green")
-            concurrent_limit_line, = ax.plot([], [], label="Concurrent Task Limit", color="purple")
-            rewards_line, = ax.plot([], [], label="rewards", color="pink")
-            time_line, = ax.plot([], [], label="Time Taken (seconds)", color="red")
-            ax.legend()
-
-        # Initialize lists to store plot data
-        batch_numbers = []
-        max_limit_data = []
-        max_workers_data = []
-        concurrent_limit_data = []
-        time_taken_data = []
-        rewards = []
-        with tqdm.tqdm(
-            total=max_count, initial=done_count, desc="Crawling Progress", unit="url"
-        ) as pbar:
-            tasks = set()
-            start = time.time()  # Initialize start time for reward calculation
-            concurrent_task_limit = self.config_manager.get_value("concurrent_task_limit", default=100, value_type=int, min_value=1, max_value=1300, policy="adaptive")
-            batch_number = 0
-            
-            bach_size = self.config_manager.get_value("bach_size", default=200, value_type=int, min_value=100, max_value=1300,policy="adaptive")
-            max_workers = self.config_manager.get_value("max_workers", default=200, value_type=int, min_value=100, max_value=1300,policy="adaptive")
-            concurrent_task_limit = self.config_manager.get_value("concurrent_task_limit", default=100, value_type=int, min_value=1, max_value=1300,policy="adaptive")
-            
-            print("batch_number->",batch_number)
-            print("bach_size->",bach_size)
-            print("max_workers->",max_workers)
-            print("concurrent_task_limit->",concurrent_task_limit)
-
-            while (await self.urls_to_visit.count_unseen()) or (await self.urls_to_visit.count_processing()):
-                async for url_item in self._url_generator():
-                    max_count = await self.urls_to_visit.count_all()
-                    pbar.total = max_count
-                    task = loop.create_task(self.fetch_and_process_url(url_item, session, pbar))
-                    tasks.add(task)
-
-                    if len(tasks) >= concurrent_task_limit:
-                        done, _ = await asyncio.wait(tasks)
-
-                        # Calculate reward and update Q-learning step
-                        time_taken = time.time() - start
-                        completed_tasks = len(done)
-
-                        if not self.has_internet_error:
-                            reward = completed_tasks / time_taken if time_taken > 0 else 0
-                            self.config_manager.step(["max_limit", "max_workers", "concurrent_task_limit"], reward)
-                            self.config_manager.save_config()
-
-                            # Retrieve new values from ConfigManager
-                            max_limit = self.config_manager.get_value("bach_size", default=100, value_type=int, min_value=50, max_value=300,policy="adaptive")
-                            max_workers = self.config_manager.get_value("max_workers",default=min(self.cpu_cores//2,1), value_type=int, min_value=self.cpu_cores, max_value=self.cpu_cores*4,policy="adaptive")
-                            concurrent_task_limit = self.config_manager.get_value("concurrent_task_limit", default=100, value_type=int, min_value=50, max_value=300,policy="adaptive")
-                            
-                            print("batch_number->",batch_number)
-                            print("max_limit->",max_limit)
-                            print("max_workers->",max_workers)
-                            print("concurrent_task_limit->",concurrent_task_limit)
-                            print("reward->",reward)
-                            self.adjust_parameters()
-                            if draw_plot:
-                                # Update plot data
-                                batch_numbers.append(batch_number)
-                                rewards.append(reward)
-                                max_limit_data.append(max_limit)
-                                max_workers_data.append(max_workers)
-                                concurrent_limit_data.append(concurrent_task_limit)
-                                time_taken_data.append(time_taken)
-
-                                # Set data for each line
-                                max_limit_line.set_data(batch_numbers, max_limit_data)
-                                max_workers_line.set_data(batch_numbers, max_workers_data)
-                                concurrent_limit_line.set_data(batch_numbers, concurrent_limit_data)
-                                rewards_line.set_data(batch_numbers,rewards)
-                                time_line.set_data(batch_numbers, time_taken_data)
-
-                                # Update plot
-                                ax.relim()
-                                ax.autoscale_view()
-                                fig.canvas.draw()
-                                fig.canvas.flush_events()
-
-                            batch_number += 1
-
-                        # Reset start time for the next batch
-                        start = time.time()
-                        tasks.difference_update(done)
-
-                if tasks:
-                    await asyncio.gather(*tasks)
-
-                self.write_to_csv()
-        if draw_plot:
-            plt.ioff()  # Turn off interactive mode at the end
-            plt.show()  # Display the final plot
-
+            plt.ioff()  # Turn off interactive mode
+            plt.show()
 
 
 
