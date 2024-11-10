@@ -6,7 +6,6 @@ import numpy as np
 from collections import defaultdict
 from itertools import product
 from typing import List
-from numba import jit
 class ConfigManager:
     def __init__(self, config_file="config.json", learning_rate=0.1, discount_factor=0.9, initial_exploration_rate=1.0, exploration_decay=0.99, global_policy="adaptive"):
         self.config_file = config_file
