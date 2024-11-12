@@ -129,8 +129,8 @@ class Crawler:
             exclude_subdirs=None,
             exclude_scrape_subdirs=None,
             exclude_lag=[],
-            piloting=True,
-                show_bar=True
+            piloting=False,
+                show_bar=False
     ):  
         self    .config_manager = ConfigManager(f"data/config_{name}.json")
         self    .start_urls = start_urls
