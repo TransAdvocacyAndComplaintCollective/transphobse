@@ -188,8 +188,9 @@ class Crawler:
         self.show_bar = show_bar
     
         # Initialize piloting metrics if enabled
-        if piloting:
+        if piloting or show_bar:
             self.batch_numbers = []
+        if piloting:
             self.rewards = []
             self.batch_size_data = []
             self.max_workers_data = []
@@ -447,7 +448,8 @@ class Crawler:
             self.update_discovery_metrics(links_to_queue)
 
             # Update the estimated total number of pages
-            self.update_estimated_total_pages(batch_number=len(self.batch_numbers))
+            if self.show_bar:
+                self.update_estimated_total_pages(batch_number=len(self.batch_numbers))
 
             # Add discovered links to the queue
             for link_info in links_to_queue:
@@ -692,7 +694,7 @@ class Crawler:
         if not self.piloting:
             return  # Skip plotting if piloting is False
         from matplotlib import pyplot as plt
-        plt.ion()  # Enable interactive mode
+        plt.ion()  # Enaif not self.pilotingble interactive mode
         fig, ax = plt.subplots()
         ax.set_title("Task Parameters and Time Taken vs. Batch Number")
         ax.set_xlabel("Batch Number")
