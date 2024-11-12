@@ -12,7 +12,7 @@ import socket
 import ssl
 import time
 from urllib.parse import urljoin, urlparse, urlunparse, quote, unquote
-
+import resource
 import aiohttp
 import aiosqlite
 import certifi
@@ -20,7 +20,7 @@ from bs4 import BeautifulSoup
 import feedparser
 import chardet
 from concurrent.futures import ThreadPoolExecutor
-import tqdm
+import numpy as np
 
 # Local imports
 from keyword_search import lookup_keyword
@@ -33,46 +33,14 @@ from utils.BackedURLQueue import BackedURLQueue, URLItem
 import utils.keywords_finder as kw_finder
 from utils.ovarit import ovarit_domain_scrape
 from utils.reddit import reddit_domain_scrape
-# from javascript import require
-
-import logging
-
-def handler_SIGHUP(signum, frame):
-    print(f"Signal {signum} received")
-
-# log to file
-logging.basicConfig(filename='meage_scrape.log', level=logging.INFO)
-
-
-async def process_article(html, url):
-    try:
-        # Run the JavaScript code asynchronously with Node.js
-        process = await asyncio.create_subprocess_exec(
-            "node", "utils/ProcessArticle.js", url,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-
-        # Send the HTML content via stdin and close stdin
-        stdout, stderr = await process.communicate(input=html.encode('utf-8'))
-
-        if process.returncode == 0:
-            article = json.loads(stdout.decode('utf-8'))  # Parse the output as JSON
-            return article
-        else:
-            print(f"Error: {stderr.decode('utf-8')}")
-            return None
-    except Exception as e:
-        print(f"Exception occurred: {e}")
-        return None
 
 # Initialize logging
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    filename='meage_scrape.log',
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
-
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -87,7 +55,6 @@ HEADERS = {
     "Sec-Fetch-User": "?1",
     "Sec-GPC": "1",
 }
-
 
 
 async def check_internet(host="8.8.8.8", port=53, timeout=3):
@@ -113,7 +80,6 @@ async def check_internet(host="8.8.8.8", port=53, timeout=3):
     except (asyncio.TimeoutError, socket.gaierror, ConnectionRefusedError, OSError):
         return False
 
-from urllib.parse import urlparse, urlunparse, quote, unquote
 
 def normalize_url_format(url: str) -> str:
     """Standardize and clean URL format by enforcing https://, removing www prefix, 
@@ -148,7 +114,6 @@ def normalize_url_format(url: str) -> str:
     return urlunparse((scheme, netloc, path, "", parsed.query, ""))
 
 
-
 class Crawler:
     def __init__(
             self,
@@ -163,10 +128,12 @@ class Crawler:
             end_date=None,
             exclude_subdirs=None,
             exclude_scrape_subdirs=None,
-            exclude_lag=[]
-    ):
-        self.config_manager = ConfigManager(f"data/config_{name}.json")
-        self.start_urls = start_urls
+            exclude_lag=[],
+            piloting=True,
+                show_bar=True
+    ):  
+        self    .config_manager = ConfigManager(f"data/config_{name}.json")
+        self    .start_urls = start_urls
         self.feeds = feeds
         self.name = name
         self.keywords = keywords
@@ -176,46 +143,74 @@ class Crawler:
         self.output_csv = f"data/{name}.csv"
         self.file_db = f"databases/{name}.db"
         self.cpu_cores = multiprocessing.cpu_count()
-        self.max_limit = self.config_manager.get_value("max_limit", default=100, value_type=int, min_value=1,
-                                                       max_value=1500, policy="adaptive")
-        self.max_workers = self.config_manager.get_value("max_workers", default=self.cpu_cores * 2, value_type=int,
-                                                         min_value=1, max_value=self.cpu_cores*4, policy="adaptive")
-        self.max_workers = self.config_manager.get_value("max_workers",default=min(self.cpu_cores//2,1), value_type=int, min_value=self.cpu_cores, max_value=self.cpu_cores*4,policy="adaptive")
-
-        self.bach_size = self.config_manager.get_value("bach_size", default=500, value_type=int,
-                                                         min_value=1, max_value=3000, policy="adaptive")
-        self.semaphore = asyncio.Semaphore(self.bach_size)
+    
+        # Initialize parameters using ConfigManager
+        self.max_limit = self.config_manager.initialize_parameter("max_limit", int, 100, 1, 1500)
+        self.max_workers = self.config_manager.initialize_parameter("max_workers", int, self.cpu_cores * 2, 1, self.cpu_cores * 4)
+        self.batch_size = self.config_manager.initialize_parameter("batch_size", int, 500, 1, 3000)
+        self.batch_size2 = self.config_manager.initialize_parameter("batch_size2", int, 500, 1, 3000)
+        self.batch_size3 = self.config_manager.initialize_parameter("batch_size3", int, 500, 1, 3000)
+        self.batch_size4 = self.config_manager.initialize_parameter("batch_size4", int, 500, 1, 3000)
+        self.concurrent_task_limit = self.config_manager.initialize_parameter("concurrent_task_limit", int, 100, 1, 500)
+        self.collect_csv_row_limit = self.config_manager.initialize_parameter("collect_csv_row", int, self.cpu_cores, 1, self.cpu_cores * 2)
+        if piloting:
+            self.batch_size_data = []
+            self.batch_size2_data = []
+            self.batch_size3_data = []
+            self.batch_size4_data = []
+    
+        # Initialize semaphores based on batch sizes
+        self.semaphore = asyncio.Semaphore(self.batch_size)
+        self.semaphore2 = asyncio.Semaphore(self.batch_size2)
+        self.semaphore3 = asyncio.Semaphore(self.batch_size3)
+        self.semaphore4 = asyncio.Semaphore(self.batch_size4)
+    
+        # Initialize thread pool with the configured max workers
         self.thread_pool = ThreadPoolExecutor(max_workers=self.max_workers)
+    
+        # Database and URL queue initialization
         self.conn = None
         self.robots = None
         self.urls_to_visit = None
+    
+        # Directory and subdirectory settings
         self.allowed_subdirs = allowed_subdirs or []
         self.start_date = start_date
         self.end_date = end_date
         self.exclude_scrape_subdirs = exclude_scrape_subdirs or []
         self.exclude_subdirs = exclude_subdirs or []
+    
+        # CSV row collection and locking mechanism
         self.csv_rows = []
         self.lock = asyncio.Lock()
         self.has_internet_error = False
-        
-        self.batch_numbers  = []
-        self.rewards  = []
-        self.batch_size_data  = []
-        self.max_workers_data  = []
-        self.concurrent_limit_data  = []
-        self.time_taken_data  = []
-        self.total_discovered_links = 0
-        
-        
-        #  attributes for estimation
+        self.piloting = piloting
+        self.show_bar = show_bar
+    
+        # Initialize piloting metrics if enabled
+        if piloting:
+            self.batch_numbers = []
+            self.rewards = []
+            self.batch_size_data = []
+            self.max_workers_data = []
+            self.concurrent_limit_data = []
+            self.time_taken_data = []
+            self.batch_size_data1 = []
+            self.batch_size_data2 = []
+            self.batch_size_data3 = []
+            self.batch_size_data4 = []
+            self.total_discovered_links = 0
+    
+        # Attributes for estimation
         self.total_discovered_links = 0
         self.average_links_per_page = 10  # Starting estimate
         self.filtering_factor = 0.8  # Assumes we skip/filter 20% of pages
         self.estimated_total_pages = 1000  # Initial rough estimate
         self.growth_rate = 0.1  # Growth rate for logistic model
         self.midpoint_batch = 5  # Midpoint for logistic growth
-        self.discovery_rate = []  # List to store the discovery rate (links found per batch)
+        self.discovery_rate = []  # Store discovery rate (links found per batch)
         self.exponential_phase = True  # Start in exponential growth phase
+
         
 
     def update_estimated_total_pages(self, batch_number):
@@ -244,17 +239,37 @@ class Crawler:
             estimated_total = L / (1 + math.exp(-k * (t - t0)))
 
         # Update the estimate
-        self.estimated_total_pages = round(max(self.estimated_total_pages, estimated_total))
+        self.estimated_total_pages = int(round(max(self.estimated_total_pages, estimated_total)))
 
     def update_discovery_rate(self, extracted_links_count):
-        """
-        Update the discovery rate based on the number of extracted links.
-        """
         self.discovery_rate.append(extracted_links_count)
         if len(self.discovery_rate) > 10:
-            # Limit the size of the discovery rate history to avoid memory issues
-            self.discovery_rate.pop(0)
-    
+            self.discovery_rate.pop(0)  # Limit the size of the history
+
+    async def process_article(self, html, url):
+        try:
+            async with self.semaphore3:
+                # Run the JavaScript code asynchronously with Node.js
+                process = await asyncio.create_subprocess_exec(
+                    "node", "utils/ProcessArticle.js", url,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+
+                # Send the HTML content via stdin and close stdin
+                stdout, stderr = await process.communicate(input=html.encode('utf-8'))
+
+                if process.returncode == 0:
+                    article = json.loads(stdout.decode('utf-8'))  # Parse the output as JSON
+                    return article
+                else:
+                    print(f"Error: {stderr.decode('utf-8')}")
+                    return None
+        except Exception as e:
+            print(f"Exception occurred: {e}")
+            return None
+
     async def initialize_db(self):
         """Set up the database and required tables."""
         self.robots = RobotsSql(self.conn, self.thread_pool)
@@ -278,7 +293,7 @@ class Crawler:
             "Type",
             "Crawled At",
         ]
-        if not os.path.exists(self.output_csv) or os.path.getsize(self.output_csv) == 0:
+        if not os.path.exists(self.output_csv) or os.path.getsize(self.output_csv) ==  0:
             with open(self.output_csv, mode="w", newline="", encoding="utf-8") as csv_file:
                 csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
                 csv_writer.writeheader()
@@ -343,8 +358,6 @@ class Crawler:
         except Exception as e:
             logger.error(f"Failed to add URL to queue: {url} - Error: {e}")
 
-
-    
     def is_valid_url(self, url):
         parsed = urlparse(url)
         return all([parsed.scheme, parsed.netloc])
@@ -354,53 +367,29 @@ class Crawler:
         ssl_context = ssl.create_default_context(cafile=certifi.where())
         retries = 5
         attempt = 0
-        backoff_base = 2  # Base for exponential backoff
         while attempt < retries:
             try:
-                async with session.get(
-                    url, ssl=ssl_context, timeout=60
-                ) as response:
+                async with session.get(url, ssl=ssl_context, timeout=60) as response:
                     if response.status == 200:
                         content_bytes = await response.read()
                         encoding = chardet.detect(content_bytes)["encoding"] or "utf-8"
                         text = content_bytes.decode(encoding, errors="replace")
-                        await self.urls_to_visit.update_status(url, "seen")
-                        return text, response.headers.get("Content-Type", "")
-                    elif response.status == 404:
-                        logger.warning(f"URL not found (404): {url}")
-                        await self.urls_to_visit.update_status(url, "error")
-                        return None, None
-                    else:
-                        logger.warning(
-                            f"Failed to fetch {url}, status code {response.status}, retrying... ({attempt + 1}/{retries})"
-                        )
+                        if text.strip():
+                            await self.urls_to_visit.update_status(url, "seen")
+                            return text, response.headers.get("Content-Type", "")
+                    intent_check = await check_internet()
+                    if intent_check:
                         attempt += 1
-                        await asyncio.sleep(backoff_base ** attempt + random.uniform(0, 1))
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                # Network-related exceptions
-                logger.error(
-                    f"Network error while fetching {url}: {e}, retrying... ({attempt + 1}/{retries})"
-                )
-                await asyncio.sleep(backoff_base ** attempt + random.uniform(0, 1))
-
-                # Check if internet connection is lost
-                if not await check_internet():
-                    self.has_internet_error= True
-                    logger.error(f"Internet connection lost while fetching {url}. Waiting for connection to be restored...")
-                    # Wait until the internet connection is restored
-                    while not await check_internet():
-                        await asyncio.sleep(5)  # Wait 5 seconds before checking again
-                    logger.info(f"Internet connection restored. Resuming fetch for {url}.")
-                else: # Internet connection is still active
-                    attempt += 1
+                        await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                    else:
+                        while not await check_internet():
+                            logger.error("Internet connection lost. Retrying...")
+                            await asyncio.sleep(5)
             except Exception as e:
-                logger.error(f"Unexpected error while fetching {url}: {e}")
-                break  # Exit the retry loop for unexpected exceptions
-
+                logger.error(f"Error fetching content for {url}: {e}")
+                attempt += 1
         await self.urls_to_visit.update_status(url, "error")
-        logger.error(f"Max retries reached for {url}")
         return None, None
-
 
     async def process_content(self, url_item, text, mime):
         metadata = {}
@@ -417,7 +406,6 @@ class Crawler:
             )
             logger.warning(f"Unsupported MIME type for {url_item.url}: {mime}")
 
-        
     def update_discovery_metrics(self, links_to_queue):
         """
         Update the total discovered links and the average number of links per page.
@@ -435,19 +423,22 @@ class Crawler:
         loop = asyncio.get_event_loop()
         try:
             if any(url_item.url.startswith(subdir) for subdir in self.exclude_scrape_subdirs):
+                await self.urls_to_visit.mark_seen(url_item.url)
                 return
             
-            article = await process_article(text, url_item.url)
-            result = await loop.run_in_executor(
-                self.thread_pool,
-                self._analyze_webpage_content_sync,
-                text,
-                url_item,
-                metadata,
-                article
-            )
+            article = await self.process_article(text, url_item.url)
+            async with self.semaphore4:
+                result = await loop.run_in_executor(
+                    self.thread_pool,
+                    self._analyze_webpage_content_sync,
+                    text,
+                    url_item,
+                    metadata,
+                    article
+                )
 
             if result is None:
+                await self.urls_to_visit.mark_seen(url_item.url)
                 return
 
             score, keywords, metadata, links_to_queue, canonical_url = result
@@ -462,10 +453,10 @@ class Crawler:
             for link_info in links_to_queue:
                 await self.add_to_queue(*link_info)
 
-            
             # Check for canonical URL and add to queue if different
             if canonical_url and url_item.url != canonical_url:
                 await self.add_to_queue(canonical_url, "webpage", priority=score)
+            await self.urls_to_visit.mark_seen(url_item.url)
                 
             # Update page score and collect CSV row if the score is positive
             if score > 0:
@@ -476,9 +467,7 @@ class Crawler:
             logger.error(f"Error in analyze_webpage_content for {url_item.url}: {e}")
             await self.urls_to_visit.update_error(url_item.url, str(e))
 
-
-
-    def _analyze_webpage_content_sync(self, text, url_item, metadata,article):
+    def _analyze_webpage_content_sync(self, text, url_item, metadata, article):
         try:
             bs = BeautifulSoup(text, "html.parser")
 
@@ -499,7 +488,8 @@ class Crawler:
             score, keywords, _ = self.key_finder.relative_keywords_score(text_content)
 
             # Extract and prepare links to queue
-            links = set(a["href"] for a in bs.find_all("a", href=True))
+            links = {a["href"] for a in bs.find_all("a", href=True)}
+
             links_to_queue = [
                 (urljoin(url_item.url, link), "webpage", score) for link in links
             ]
@@ -517,7 +507,6 @@ class Crawler:
         except Exception as e:
             logger.error(f"Error in _analyze_webpage_content_sync: {e}")
             return None
-
 
     def _extract_canonical_links_sync(self, bs):
         try:
@@ -561,9 +550,6 @@ class Crawler:
                 if microdata and isinstance(microdata, dict):  # Ensure microdata is a dictionary
                     metadata.update(microdata)
         except Exception as e:
-            # await self.urls_to_visit.update_error(
-            #     url, f"Metadata extraction failed: {e}"
-            # )
             logger.error(f"Failed to extract metadata for {url}: {e}")
         return metadata
 
@@ -573,17 +559,17 @@ class Crawler:
             if key == "@type" and isinstance(value, str):
                 value = [value]
 
-            if isinstance(target[key], list) and isinstance(value, list):
+            if isinstance(target.get(key), list) and isinstance(value, list):
                 target[key].extend(value)
-            elif isinstance(target[key], list):
+            elif isinstance(target.get(key), list):
                 target[key].append(value)
             elif isinstance(value, list):
-                target[key] = [target[key]] + value
+                target[key] = [target.get(key, ""), *value]
             elif key in target:
                 target[key] = [target[key], value]
             else:
                 target[key] = value
-    
+
     def extract_json_ld(self, bs):
         all_data = defaultdict(list)
 
@@ -612,6 +598,7 @@ class Crawler:
             logger.error(f"Error extracting JSON-LD: {e}")
 
         return dict(all_data)
+
     def extract_microdata(self, bs):
         microdata_items = {}
 
@@ -623,37 +610,6 @@ class Crawler:
 
         return microdata_items
 
-    async def extract_and_queue_links(self, bs, url, score):
-        loop = asyncio.get_event_loop()
-        # Extract and queue links for further crawling
-        links = await loop.run_in_executor(
-            self.thread_pool,
-            self._extract_links_sync,
-            bs
-        )
-        for link in links:
-            full_url = urljoin(url, link)
-            await self.add_to_queue(full_url, "webpage", priority=score)
-    
-    def _analyze_content_sync(self, content_to_score):
-        try:
-            bs_content = BeautifulSoup(content_to_score, "html.parser")
-            text_content = bs_content.get_text(separator=" ")
-            score, keywords, _ = self.key_finder.relative_keywords_score(text_content)
-            return text_content, score, keywords
-        except Exception as e:
-            logger.error(f"Error in _analyze_content_sync: {e}")
-            return None
-        
-    def _extract_links_sync(self, bs):
-        try:
-            links = set(a["href"] for a in bs.find_all("a", href=True))
-            return links
-        except Exception as e:
-            logger.error(f"Error extracting links: {e}")
-            return set()
-
-
     def collect_csv_row(self, url_item, score, keywords, metadata):
         root_url = urlparse(url_item.url).netloc
         crawled_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
@@ -663,16 +619,16 @@ class Crawler:
             "Score": score,
             "Keywords Found": ", ".join(keywords),
             "Headline": metadata.get("headline"),
-            "name": metadata.get("name"),
+            "Name": metadata.get("name"),
             "Date Published": metadata.get("datePublished", ""),
             "Date Modified": metadata.get("dateModified", ""),
             "Author": metadata.get("author", ""),
             "Byline": metadata.get("byline", ""),
-            "type": metadata.get("@type", ""),
-            "crawled at": crawled_at,
+            "Type": metadata.get("@type", ""),
+            "Crawled At": crawled_at,
         }
         self.csv_rows.append(row)
-        if len(self.csv_rows) >= 100:
+        if len(self.csv_rows) >= self.collect_csv_row_limit:
             self.write_to_csv()
 
     def write_to_csv(self):
@@ -697,57 +653,90 @@ class Crawler:
                 await self.urls_to_visit.mark_processing(url_item.url)
                 yield url_item
 
-
     def adjust_parameters(self):
-        print("adjust_parameters")
-        """Adjust parameters based on updated Q-values."""
-        # Retrieve updated values for 'max_limit' and 'max_workers'
-        
-        self.bach_size = self.config_manager.get_value("bach_size", default=500, value_type=int,
-                                                         min_value=1, max_value=3000, policy="adaptive")
-        self.max_workers = self.config_manager.get_value(
-            "max_workers", default=self.cpu_cores*2, value_type=int, min_value=1, max_value=self.cpu_cores*4, policy="adaptive"
-        )
+        """
+        Adjust task parameters based on updated Q-values from the ConfigManager.
+        """
+        try:
+            # Retrieve updated values from ConfigManager
+            self.max_limit = self.config_manager.get_value("max_limit", default=100)
+            self.max_workers = self.config_manager.get_value("max_workers", default=self.cpu_cores * 2)
+            self.batch_size = self.config_manager.get_value("batch_size", default=500)
+            self.batch_size2 = self.config_manager.get_value("batch_size2", default=500)
+            self.batch_size3 = self.config_manager.get_value("batch_size3", default=500)
+            self.batch_size4 = self.config_manager.get_value("batch_size4", default=500)
+            self.concurrent_task_limit = self.config_manager.get_value("concurrent_task_limit", default=100)
+            self.collect_csv_row_limit = self.config_manager.get_value("collect_csv_row", default=self.cpu_cores)
 
-        # Update semaphore and thread pool if values have changed
-        self.semaphore._value = self.bach_size
-        logger.info(f"Updated max_limit to {self.bach_size}")
-        self.thread_pool._max_workers = self.max_workers
-        logger.info(f"Updated max_workers to {self.max_workers}")
-    
+            # Correct semaphore initialization without directly modifying _value
+            self.semaphore = asyncio.Semaphore(self.batch_size)
+            self.semaphore2 = asyncio.Semaphore(self.batch_size2)
+            self.semaphore3 = asyncio.Semaphore(self.batch_size3)
+            self.semaphore4 = asyncio.Semaphore(self.batch_size4)
+
+            # Update the thread pool with the new max workers
+            self.thread_pool._max_workers = self.max_workers
+
+            # Log the updated parameters
+            logger.info(
+                f"Adjusted parameters: batch_size={self.batch_size}, "
+                f"max_workers={self.max_workers}, concurrent_task_limit={self.concurrent_task_limit}, "
+                f"batch_size2={self.batch_size2}, batch_size3={self.batch_size3}, batch_size4={self.batch_size4}"
+            )
+
+        except Exception as e:
+            logger.error(f"Error adjusting parameters: {e}")
+
     async def initialize_plot(self):
         """Initialize the live plot for tracking progress and metrics."""
+        if not self.piloting:
+            return  # Skip plotting if piloting is False
         from matplotlib import pyplot as plt
-        plt.ion()
+        plt.ion()  # Enable interactive mode
         fig, ax = plt.subplots()
         ax.set_title("Task Parameters and Time Taken vs. Batch Number")
         ax.set_xlabel("Batch Number")
         ax.set_ylabel("Metrics")
 
-        self.max_limit_line, = ax.plot([], [], label="Batch Size", color="blue")
+        # Initialize lines for different metrics
+        self.batch_size_line, = ax.plot([], [], label="Batch Size", color="blue")
+        self.batch_size2_line, = ax.plot([], [], label="Batch Size 2", color="cyan")
+        self.batch_size3_line, = ax.plot([], [], label="Batch Size 3", color="magenta")
+        self.batch_size4_line, = ax.plot([], [], label="Batch Size 4", color="orange")
         self.max_workers_line, = ax.plot([], [], label="Max Workers", color="green")
-        self.concurrent_limit_line, = ax.plot([], [], label="Concurrent Task Limit", color="purple")
+        self.concurrent_limit_line, = ax.plot([], [], label="Concurrent Task Limit", color="brown")
         self.rewards_line, = ax.plot([], [], label="Rewards", color="pink")
         self.time_line, = ax.plot([], [], label="Time Taken (seconds)", color="red")
         ax.legend()
         self.fig, self.ax = fig, ax
 
-    async def log_parameters(self, batch_number, batch_size, max_workers, concurrent_task_limit):
+    async def log_parameters(self, batch_number, batch_size, max_workers, concurrent_task_limit, batch_size2, batch_size3, batch_size4, reward):
         """Log the current parameters for this batch."""
-        logger.info(f"Batch {batch_number}: batch_size={batch_size}, max_workers={max_workers}, "
-                    f"concurrent_task_limit={concurrent_task_limit}")
+        logger.info(
+            f"Batch {batch_number}: batch_size={batch_size}, max_workers={max_workers}, "
+            f"concurrent_task_limit={concurrent_task_limit}, batch_size2={batch_size2}, "
+            f"batch_size3={batch_size3}, batch_size4={batch_size4}, reward={reward}"
+        )
 
-    def update_plot_data(self, batch_number, reward, batch_size, max_workers, concurrent_task_limit, time_taken):
-        """Update the live plot data."""
+    def update_plot_data(self, batch_number, reward, batch_size, max_workers, concurrent_task_limit, batch_size2, batch_size3, batch_size4, time_taken):
+        """Update the live plot data with all relevant parameters."""
+        if not self.piloting:
+            return  # Skip updating plot if piloting is False
         self.batch_numbers.append(batch_number)
         self.rewards.append(reward)
         self.batch_size_data.append(batch_size)
+        self.batch_size2_data.append(batch_size2)
+        self.batch_size3_data.append(batch_size3)
+        self.batch_size4_data.append(batch_size4)
         self.max_workers_data.append(max_workers)
         self.concurrent_limit_data.append(concurrent_task_limit)
         self.time_taken_data.append(time_taken)
 
         # Update lines with new data
-        self.max_limit_line.set_data(self.batch_numbers, self.batch_size_data)
+        self.batch_size_line.set_data(self.batch_numbers, self.batch_size_data)
+        self.batch_size2_line.set_data(self.batch_numbers, self.batch_size2_data)
+        self.batch_size3_line.set_data(self.batch_numbers, self.batch_size3_data)
+        self.batch_size4_line.set_data(self.batch_numbers, self.batch_size4_data)
         self.max_workers_line.set_data(self.batch_numbers, self.max_workers_data)
         self.concurrent_limit_line.set_data(self.batch_numbers, self.concurrent_limit_data)
         self.rewards_line.set_data(self.batch_numbers, self.rewards)
@@ -762,19 +751,38 @@ class Crawler:
     async def gather_tasks(self, session, tasks, concurrent_task_limit, pbar):
         """Collect tasks up to the concurrency limit."""
         async for url_item in self._url_generator():
+            await self.urls_to_visit.mark_processing(url_item.url)
             task = asyncio.create_task(self.fetch_and_process_url(url_item, session, pbar))
             tasks.add(task)
             if len(tasks) >= concurrent_task_limit:
                 break
         return tasks
 
-    async def update_q_learning(self, completed_tasks, time_taken):
-        """Calculate the reward and update Q-learning."""
-        reward = completed_tasks / time_taken if time_taken > 0 else 0
-        self.config_manager.step(["batch_size", "max_workers", "concurrent_task_limit"], reward)
-        self.config_manager.save_config()
-        self.adjust_parameters()
-        return reward
+    async def update_q_learning(self, completed_tasks, time_taken, memory_in_bytes):
+        """
+        Calculate the reward and update Q-learning for multiple parameters.
+        """
+        try:
+            # Convert memory usage to MB
+            memory_in_mb = memory_in_bytes / (1024 ** 2)
+
+            # Calculate reward based on tasks, time, and memory usage
+            reward = (completed_tasks / max(time_taken, 1e-6)) * np.exp(-memory_in_mb / 100)
+
+            # Update Q-learning for all relevant parameters
+            parameter_names = ["batch_size", "max_workers", "concurrent_task_limit", "batch_size2", "batch_size3", "batch_size4"]
+            self.config_manager.step(reward, parameter_names)
+
+            # Save the updated configuration
+            self.config_manager.save_config()
+
+            # Adjust parameters based on updated Q-values
+            self.adjust_parameters()
+
+            return reward
+        except Exception as e:
+            logger.error(f"Error updating Q-learning: {e}")
+            return 0
 
     async def fetch_and_process(self, session, tasks, pbar):
         """Fetch and process tasks, handling completed ones."""
@@ -782,67 +790,89 @@ class Crawler:
             done, _ = await asyncio.wait(tasks)
             completed_tasks = len(done)
             tasks.difference_update(done)
-            pbar.update(completed_tasks)
+            if self.show_bar and pbar is not None:
+                pbar.update(completed_tasks)
+        else:
+            completed_tasks = 0
         return completed_tasks
 
-    async def _crawl_loop(self, session,plot = False):
+    async def _crawl_loop(self, session):
         """Main loop for crawling with adaptive Q-learning and live plotting."""
         if await self.urls_to_visit.empty():
             logger.info("No URLs left to visit. Exiting crawl loop.")
             return
-        if plot:
-            await self.initialize_plot()
+
+        await self.initialize_plot()
+
         start_time = time.time()
         tasks = set()
         batch_number = 0
-        pbar = tqdm.tqdm(total=max(await self.urls_to_visit.count_all(),self.estimated_total_pages), desc="Crawling Progress", unit="url")
+        memory_in_bytes = 0
+
+        if self.show_bar:
+            import tqdm
+            pbar = tqdm.tqdm(
+                total=max(await self.urls_to_visit.count_all(), self.estimated_total_pages),
+                desc="Crawling Progress",
+                unit="url"
+            )
+        else:
+            pbar = None
 
         while not await self.urls_to_visit.empty() or tasks:
-            concurrent_task_limit = self.config_manager.get_value("concurrent_task_limit", default=100, value_type=int)
+            # Retrieve adaptive parameter values
             batch_size = self.config_manager.get_value("batch_size", default=500, value_type=int)
             max_workers = self.config_manager.get_value("max_workers", default=self.cpu_cores * 2, value_type=int)
-
-            await self.log_parameters(batch_number, batch_size, max_workers, concurrent_task_limit)
+            concurrent_task_limit = self.config_manager.get_value("concurrent_task_limit", default=100, value_type=int)
+            batch_size2 = self.config_manager.get_value("batch_size2", default=500, value_type=int)
+            batch_size3 = self.config_manager.get_value("batch_size3", default=500, value_type=int)
+            batch_size4 = self.config_manager.get_value("batch_size4", default=500, value_type=int)
+            memory_in_bytes = max(memory_in_bytes, resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
 
             tasks = await self.gather_tasks(session, tasks, concurrent_task_limit, pbar)
             completed_tasks = await self.fetch_and_process(session, tasks, pbar)
 
             if completed_tasks > 0:
-                pbar.total = max(await self.urls_to_visit.count_all(),self.estimated_total_pages)
+                if self.show_bar and pbar is not None:
+                    pbar.total = max(await self.urls_to_visit.count_all(), self.estimated_total_pages)
                 time_taken = time.time() - start_time
-                reward = await self.update_q_learning(completed_tasks, time_taken)
+                reward = await self.update_q_learning(completed_tasks, time_taken, memory_in_bytes)
+                await self.log_parameters(batch_number, batch_size, max_workers, concurrent_task_limit, batch_size2, batch_size3, batch_size4, reward)
                 self.adjust_parameters()
                 self.config_manager.save_config()
-                if plot:
-                    self.update_plot_data(batch_number, reward, batch_size, max_workers, concurrent_task_limit, time_taken)
 
-                # Reset start time for next batch
+                self.update_plot_data(batch_number, reward, batch_size, max_workers, concurrent_task_limit, batch_size2, batch_size3, batch_size4, time_taken)
+
+                # Reset start time for the next batch
                 start_time = time.time()
                 batch_number += 1
-        if plot:
+                memory_in_bytes = 0
+
+        if self.piloting:
             from matplotlib import pyplot as plt
             plt.ioff()  # Turn off interactive mode
             plt.show()
 
-
-
-    async def fetch_and_process_url(self, url_item, session,pbar):
+    async def fetch_and_process_url(self, url_item, session, pbar):
         if not url_item:
             return
 
-        # async with self.semaphore:
-        if True:
-            try:
+        try:
+            async with self.semaphore:
                 text, mime = await self.fetch_content(session, url_item)
+            async with self.semaphore2:
                 if text:
                     await self.process_content(url_item, text, mime)
                 else:
                     logger.error(f"Empty content for {url_item.url}")
-            except Exception as e:
-                logger.error(f"Error processing {url_item.url}: {e}")
-        
-        pbar.update(1)
 
+        except Exception as e:
+            logger.error(f"Error processing {url_item.url}: {e}")
+
+        finally:
+            if self.show_bar and pbar is not None:
+                pbar.update(1)
+            
     async def crawl_start(self):
         os.makedirs(os.path.dirname(self.file_db), exist_ok=True)
         async with aiosqlite.connect(self.file_db) as self.conn:
