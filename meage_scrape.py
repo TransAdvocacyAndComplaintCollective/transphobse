@@ -21,6 +21,7 @@ import feedparser
 import chardet
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
+import signal, os
 
 # Local imports
 from keyword_search import lookup_keyword
@@ -33,7 +34,7 @@ from utils.BackedURLQueue import BackedURLQueue, URLItem
 import utils.keywords_finder as kw_finder
 from utils.ovarit import ovarit_domain_scrape
 from utils.reddit import reddit_domain_scrape
-
+signal.getsignal
 # Initialize logging
 logging.basicConfig(
     filename='meage_scrape.log',
@@ -129,8 +130,8 @@ class Crawler:
             exclude_subdirs=None,
             exclude_scrape_subdirs=None,
             exclude_lag=[],
-            piloting=False,
-                show_bar=False
+            piloting=True,
+                show_bar=True
     ):  
         self    .config_manager = ConfigManager(f"data/config_{name}.json")
         self    .start_urls = start_urls

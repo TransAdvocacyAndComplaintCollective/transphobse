@@ -28,6 +28,10 @@ lemmatizer = WordNetLemmatizer()
 
 KEYWORDS = [
     "trans woman",
+    "trans ",
+    "non-binary",
+    "trans-",
+    "trans\n",
     "tranny",
     "demigal",
     "kathoey",

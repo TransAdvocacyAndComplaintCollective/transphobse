@@ -17,6 +17,9 @@ class ConfigManager:
         self.meta_policy_dict = {}
         self.parameters = {}
         self.last_policies_used = {}  # Keep track of policies used
+        self.last_actions_taken = {}  # Keep track of last actions taken
+        
+        self.converged_parameters = set()  # Track converged parameters
 
         # RL Hyperparameters
         self.tolerance = 1e-3
@@ -24,6 +27,7 @@ class ConfigManager:
         self.discount_factor = 0.9
         self.exploration_decay = 0.99
         self.initial_exploration_rate = 1.0
+        self.min_exploration_rate = 0.1
         self.step_size = 1  # Define step size for parameter updates
 
         # Define policy functions
@@ -47,28 +51,29 @@ class ConfigManager:
     def greedy_policy(self, parameter_name: str) -> int:
         param_values = self.q_values.get(parameter_name, {})
         if not param_values:
-            return self.parameters[parameter_name]["value"]
+            return self.random_policy(parameter_name)
 
         # Find the action with the highest Q-value
         best_action = max(param_values, key=lambda a: param_values[a]['Q'])
         return best_action
 
     def epsilon_greedy_policy(self, parameter_name: str) -> int:
-        if random.random() < self.exploration_rates.get(parameter_name, self.initial_exploration_rate):
-            return self.random_policy(parameter_name)
-        return self.greedy_policy(parameter_name)
-
+        exploration_rate = self.exploration_rates.get(parameter_name, self.initial_exploration_rate)
+        if parameter_name in self.converged_parameters or random.random() >= exploration_rate:
+            return self.greedy_policy(parameter_name)
+        return self.random_policy(parameter_name)
+    
     def meta_policy(self, parameter_name: str) -> str:
         # Ensure meta_policy_dict entry exists
         if parameter_name not in self.meta_policy_dict:
             self.meta_policy_dict[parameter_name] = {
-                "epsilon_greedy": 0.5,
-                "boltzmann": 0.5,
-                "thompson_sampling": 0.5,
-                "ucb": 0.5,
-                "softmax": 0.5,
-                "greedy": 0.5,
-                "random": 0.5,
+                "epsilon_greedy": 1.0,
+                "boltzmann": 1.0,
+                "thompson_sampling": 1.0,
+                "ucb": 1.0,
+                "softmax": 1.0,
+                "greedy": 1.0,
+                "random": 1.0,
             }
 
         # Calculate the total score for normalization
@@ -184,6 +189,20 @@ class ConfigManager:
         # Ensure the value is cast to the specified type
         return value_type(param["value"])
 
+    def check_convergence(self, parameter_name: str) -> bool:
+        param_values = self.q_values.get(parameter_name, {})
+        if len(param_values) < 2:
+            return False
+
+        q_values = [values['Q'] for values in param_values.values()]
+        variance = np.var(q_values)
+
+        if variance < self.tolerance:
+            logger.info(f"Parameter '{parameter_name}' has converged (variance: {variance:.6f}).")
+            self.converged_parameters.add(parameter_name)
+            return random.randint(0, 4) != 3
+        return False
+    
     def step(self, reward: float, parameter_names: list) -> None:
         """
         Update Q-values and parameter values based on the received reward.
@@ -193,74 +212,66 @@ class ConfigManager:
         """
         try:
             for param in parameter_names:
-                # Ensure q_values[param] exists
-                if param not in self.q_values:
-                    self.q_values[param] = {}
-
-                # Select action using a policy
-                policy_name = self.meta_policy(param)
-                policy = self.policy_functions.get(policy_name, self.epsilon_greedy_policy)
-                action = policy(param)
-                self.last_policies_used[param] = policy_name
+                if (param in self.converged_parameters) and random.randint(0, 4) != 3:
+                    logger.info(f"Parameter '{param}' has converged. Skipping updates.")
+                    continue
 
                 # Get the previous action taken
                 prev_action = self.parameters[param]["value"]
 
-                # Update Q-value for the previous action
+                # Initialize Q-values for the previous action if not present
                 if prev_action not in self.q_values[param]:
                     self.q_values[param][prev_action] = {'Q': 0.0, 'N': 0}
 
                 Q_prev = self.q_values[param][prev_action]['Q']
                 N_prev = self.q_values[param][prev_action]['N']
 
-                # Update Q-value
+                # Update Q-value using the reward
                 alpha = self.learning_rate
-                Q_prev = Q_prev + alpha * (reward - Q_prev)
+                Q_new = Q_prev + alpha * (reward - Q_prev)
+                N_new = N_prev + 1
 
-                # Increment count
-                N_prev += 1
+                # Store the updated Q-value and visit count
+                self.q_values[param][prev_action] = {'Q': Q_new, 'N': N_new}
+                logger.info(f"Updated Q-value for parameter '{param}', action {prev_action}: Q={Q_new}, N={N_new}")
 
-                # Store back
-                self.q_values[param][prev_action]['Q'] = Q_prev
-                self.q_values[param][prev_action]['N'] = N_prev
-
-                logger.info(f"Updated Q-value for parameter '{param}', action {prev_action}: Q={Q_prev}, N={N_prev}")
-
-                # Update the meta-policy scores based on the reward
-                if policy_name:
-                    # Ensure meta_policy_dict entry exists
-                    if param not in self.meta_policy_dict:
-                        self.meta_policy_dict[param] = {
-                            "epsilon_greedy": 0.5,
-                            "boltzmann": 0.5,
-                            "thompson_sampling": 0.5,
-                            "ucb": 0.5,
-                            "softmax": 0.5,
-                            "greedy": 0.5,
-                            "random": 0.5,
-                        }
-                    old_score = self.meta_policy_dict[param][policy_name]
-                    new_score = old_score + alpha * (reward - old_score)
-                    self.meta_policy_dict[param][policy_name] = new_score
-                    logger.debug(f"Updated meta-policy score for '{param}' policy '{policy_name}': {new_score}")
-
-                # Adjust exploration rate
+                # Decay the exploration rate
                 self.exploration_rates[param] *= self.exploration_decay
-                self.exploration_rates[param] = max(self.exploration_rates[param], 0.1)
+                self.exploration_rates[param] = max(self.exploration_rates[param], self.min_exploration_rate)
+                logger.debug(f"Exploration rate for '{param}' adjusted to {self.exploration_rates[param]:.4f}")
 
-                # Set the new action as the parameter value
+                # Check for convergence based on the variance of Q-values
+                if self.check_convergence(param):
+                    # Lock the parameter to prevent further exploration
+                    best_action = self.greedy_policy(param)
+                    self.set_env_value(param, best_action)
+                    logger.info(f"Parameter '{param}' converged. Using best action: {best_action}")
+                    continue
+
+                # Select the next action using a policy
+                policy_name = self.meta_policy(param)
+                policy = self.policy_functions.get(policy_name, self.epsilon_greedy_policy)
+                action = policy(param)
                 self.set_env_value(param, action)
-
                 logger.info(f"Parameter '{param}' set to new action {action} using policy '{policy_name}'.")
 
-                logger.debug(f"Exploration rate for '{param}' adjusted to {self.exploration_rates[param]:.4f}")
+                # Update the meta-policy scores based on the reward
+                if param not in self.meta_policy_dict:
+                    self.meta_policy_dict[param] = {
+                        policy: 1.0 for policy in self.policy_functions.keys()
+                    }
+
+                old_score = self.meta_policy_dict[param].get(policy_name, 1.0)
+                new_score = old_score + alpha * (reward - old_score)
+                self.meta_policy_dict[param][policy_name] = new_score
+                logger.debug(f"Updated meta-policy score for '{param}' policy '{policy_name}': {new_score}")
 
             logger.info("Step completed with Q-values and parameter values updated.")
 
         except Exception as e:
             logger.error(f"Error in step(): {e}")
 
-    # Additional policy methods can be added back if needed
+
     def boltzmann_policy(self, parameter_name: str, tau: float = 1.0) -> int:
         param_values = self.q_values.get(parameter_name, {})
         if not param_values:
@@ -307,12 +318,10 @@ class ConfigManager:
         for action, values in param_values.items():
             Q_a = values['Q']
             N_a = values['N']
-            if N_a == 0:
-                sampled_values[action] = random.uniform(0, 1)
-            else:
-                alpha = Q_a * N_a + 1
-                beta = (1 - Q_a) * N_a + 1
-                sampled_values[action] = np.random.beta(alpha, beta)
+            # Assume reward is in [0,1], adjust alpha and beta accordingly
+            alpha = Q_a * N_a + 1
+            beta = (1 - Q_a) * N_a + 1
+            sampled_values[action] = np.random.beta(alpha, beta)
 
         best_action = max(sampled_values, key=sampled_values.get)
         return best_action
@@ -343,23 +352,24 @@ if __name__ == "__main__":
         if output == target:
             reward = 1.0  # High reward for hitting the target
             print("Target reached!")
-            # Optionally break the loop if target is reached
-            break
-        elif output < target:
-            reward = 0.5 / (abs(output - target) + 1)  # Positive reward, inversely proportional to the difference
+            # Perform an optimization step and update the parameters
+            config_manager.step(reward, list(config_manager.parameters.keys()))
+            # Save the configuration after each step
+            config_manager.save_config()
+            break  # Exit the loop if the target is reached
         else:
-            reward = 0.3 / (abs(output - target) + 1)  # Lower reward for overshooting
+            # Reward inversely proportional to the absolute difference
+            reward = 1.0 / (abs(output - target) + 1)
+            print(f"Calculated reward: {reward:.4f}")
 
-        print(f"Calculated reward: {reward:.4f}")
+            # Perform an optimization step and update the parameters
+            config_manager.step(reward, list(config_manager.parameters.keys()))
 
-        # Perform an optimization step and update the parameters
-        config_manager.step(reward, list(config_manager.parameters.keys()))
+            # Save the configuration after each step
+            config_manager.save_config()
 
-        # Save the configuration after each step
-        config_manager.save_config()
-
-        # Optional: Print current parameter values
-        current_params = {param: config_manager.get_value(param) for param in config_manager.parameters}
-        print(f"Current Parameters: {current_params}\n")
+            # Optional: Print current parameter values
+            current_params = {param: config_manager.get_value(param) for param in config_manager.parameters}
+            print(f"Current Parameters: {current_params}\n")
     else:
         print("Reached maximum iterations without fully converging.")

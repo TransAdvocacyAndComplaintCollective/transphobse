@@ -3,11 +3,9 @@ import re
 import spacy
 import unicodedata
 import ahocorasick
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import nltk
 from nltk.stem import SnowballStemmer
+import nltk
 import utils.keywords as kw
-
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -16,7 +14,7 @@ logger = logging.getLogger(__name__)
 nltk.download('punkt')
 
 class KeypaceFinder:
-    def __init__(self, keywords=kw.KEYWORDS):
+    def __init__(self, keywords:list[str]=kw.KEYWORDS):
         # Initialize spaCy model and NLTK stemmer
         try:
             self.nlp = spacy.load("en_core_web_sm")
@@ -28,6 +26,7 @@ class KeypaceFinder:
 
         self.stemmer = SnowballStemmer("english")
         self.keypace_automaton = self.build_automaton(keywords)
+        self.keywords = keywords
 
     @staticmethod
     def build_automaton(keyphrases):
@@ -42,14 +41,15 @@ class KeypaceFinder:
     def normalize_text(self, text):
         """Normalizes text by removing special characters, accents, and extra spaces."""
         if not text:
-            return ""
+            return "", text
         # Replace specific characters with spaces, remove accents, and clean punctuation
-        text = re.sub(r"[-_\n]", " ", text)
+        original_text = text
+        # text = re.sub(r"[-_\n]", " ", text)
         text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("utf-8")
-        text = re.sub(r"[^\w\s]", "", text)
-        text = re.sub(r"\s+", " ", text).strip().lower()
-        return self.stem_phrase(text)
-
+        # text = re.sub(r"[^\w\s]", "", text)
+        # text = re.sub(r"\s+", " ", text).strip().lower()
+        return self.stem_phrase(text), text
+    
     def stem_phrase(self, phrase):
         """Stems each word in a phrase using NLTK's SnowballStemmer."""
         words = phrase.split()
@@ -65,24 +65,44 @@ class KeypaceFinder:
             found_keypaces.append((phrase, start_index, end_index))
         return found_keypaces
 
+    def find_keypaces2(self, text):
+        """Finds key phrases in the text using a simple list-based matching."""
+        found_keypaces = []
+        for phrase in self.keywords:
+            phrase_lower = phrase.lower()
+            start_index = text.lower().find(phrase_lower)
+            while start_index != -1:
+                end_index = start_index + len(phrase_lower) - 1
+                found_keypaces.append((phrase, start_index, end_index))
+                # Search for the next occurrence of the phrase
+                start_index = text.lower().find(phrase_lower, start_index + 1)
+        return found_keypaces
+
     def relative_keywords_score(self, text):
         """Calculates the number of unique key phrases in the text and returns the score."""
-        normalized_text = self.normalize_text(text)
-        if not normalized_text:
-            return 0, [], []
+        normalized_text, original_text = self.normalize_text(text)
+        logger.debug(f"Normalized Text: {normalized_text}")
+        logger.debug(f"Original Text: {original_text}")
 
+        # Try normalized text first
         found_keypaces = self.find_keypaces(normalized_text)
-        
-        # Extract only unique key phrases for scoring
-        found_keypaces_only = [phrase for phrase, _, _ in found_keypaces]
-        unique_keypaces = list(set(found_keypaces_only))  # Deduplicate
+        if found_keypaces:
+            found_keypaces_only = [phrase for phrase, _, _ in found_keypaces]
+            unique_keypaces = list(set(found_keypaces_only))  # Deduplicate
+            return len(unique_keypaces), unique_keypaces, found_keypaces
 
-        return len(unique_keypaces), unique_keypaces, found_keypaces
-
+        # Fallback to raw matching using find_keypaces2
+        logger.warning("No key phrases found in normalized text. Falling back to raw matching.")
+        found_keypaces_raw = self.find_keypaces2(original_text)
+        found_keypaces_only_raw = [phrase for phrase, _, _ in found_keypaces_raw]
+        unique_keypaces_raw = list(set(found_keypaces_only_raw))  # Deduplicate
+        return len(unique_keypaces_raw), unique_keypaces_raw, found_keypaces_raw
 
 # Example usage:
 if __name__ == "__main__":
-    sample_text = "Your sample text goes here."
-    finder = KeypaceFinder()
+    keywords = ["trans rights", "gender equality", "non-binary", "LGBTQ+", "transgender"]
+    sample_text = "Your sample text goes here, mentioning Trans Rights and Gender Equality."
+    
+    finder = KeypaceFinder(keywords)
     score, keypaces, _ = finder.relative_keywords_score(sample_text)
     print(f"Score: {score}, Keypaces: {keypaces}")
