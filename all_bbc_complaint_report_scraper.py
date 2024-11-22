@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import camelot
 import re
-
+from rapidfuzz import fuzz
 from utils.keywords_finder import KeypaceFinder
 
 headers = {
@@ -34,6 +34,90 @@ EXPECTED_HEADERS = ["Programme", "Service", "Date of Transmission", "Issue", "Ou
 # Function to clean newline characters from the data
 def clean_newlines(df):
     return df.map(lambda x: x.replace("\n", " ") if isinstance(x, str) else x)
+
+
+
+def extract_text_from_pdf(pdf_reader,pdf_path):
+    """Extract text from a PDF using PyPDF2."""
+    extracted_text = []
+    try:
+        for page in pdf_reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                extracted_text.append(page_text)
+    except Exception as e:
+        print(f"Error reading {pdf_path}: {e}")
+        return None
+    return "\n".join(extracted_text)
+
+
+def parse_programme_segments(text, pdf_path):
+    """Parse text into segments based on programme patterns."""
+    # Define regex patterns
+    date_pattern = r"(((|\d{1,2}|(\d{1,2}[A-z ]*)\s(and|-|–|&)\s)?(\d{1,2} [A-z ]* \d{4}?|\d{1,2}? [A-z ]* \d{4})[a-z ]*)|Date withheld)"
+    station_pattern = r"[A-Za-z0-9&'/)(.’\- ]+"
+    programme_pattern = r"[A-Za-z0-9?&,:/“’”()\-'’ ]+"
+
+    patterns = {
+        "prog_station_date": re.compile(
+            rf"^(?P<programme>{programme_pattern}),\s*(?P<station>{station_pattern}),\s*(?P<date>{date_pattern})$"
+        ),
+        "prog_date": re.compile(
+            rf"^(?P<programme>{programme_pattern}),\s*(?P<date>{date_pattern})$"
+        ),
+        "station_prog_date": re.compile(
+            rf"^(?P<station>{station_pattern}),\s*(?P<programme>{programme_pattern}),\s*(?P<date>{date_pattern})$"
+        ),
+        "prog_wip": re.compile(
+            rf"^(?P<programme>{programme_pattern})\s+\(Working title\)$"
+        ),
+        "red_button": re.compile(
+            rf"^(?P<station>BBC Red Button(?: text service closure)?)$"
+        ),
+        "site": re.compile(
+            rf"^(?P<programme>{programme_pattern})\s+,bbc\.co\.uk$"
+        ),
+    }
+
+    lines = text.split("\n")
+    segments = []
+    current_segment = None
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue  # Skip empty lines
+
+        match = None
+        for pattern_name, pattern in patterns.items():
+            match = pattern.match(line)
+            if match:
+                break
+
+        if match:
+            # Save the current segment before starting a new one
+            if current_segment:
+                segments.append(current_segment)
+
+            # Start a new segment
+            current_segment = {
+                "Programme": match.group("programme").strip() if "programme" in match.groupdict() else None,
+                "Station": match.group("station").strip() if "station" in match.groupdict() else None,
+                "Date": match.group("date").strip() if "date" in match.groupdict() else None,
+                "Text Between": "",
+                "PDF Path": pdf_path,
+            }
+        else:
+            # Accumulate text for the current segment
+            if current_segment:
+                current_segment["Text Between"] += line + "\n"
+
+    # Append the last segment if it exists
+    if current_segment:
+        segments.append(current_segment)
+
+    return segments
+
 
 
 # Function to check if two bounding boxes overlap
@@ -77,17 +161,19 @@ def is_bbox_overlap(
 
 # Function to scrape the content from the web page pointed to by a URL
 def scrape_web_content(url):
-    if (
-        url
-        == "https://www.ofcom.org.uk/tv-radio-and-on-demand/broadcast-codes/broadcast-code"
-    ):
+    SKIP_URLS = [
+        "https://www.ofcom.org.uk/tv-radio-and-on-demand/broadcast-codes/broadcast-code",
+        "http://www.bbc.co.uk/complaints/complaint/",
+        "http://www.bbc.co.uk/complaints/handle-complaint/",
+    ]
+    if url in SKIP_URLS:
         return ""
     try:
-        response = requests.get(url, timeout=60)
+        response = requests.get(url, timeout=60*10)
         if response.status_code != 200:
             return ""
         response.raise_for_status()  # Check if the request was successful
-        soup = BeautifulSoup(response.content, "html.parser")
+        soup = BeautifulSoup(response.content, "lxml")
         return " ".join([p.text for p in soup.find_all("p")])
     except requests.RequestException as e:
         logging.error(f"Failed to scrape {url}: {e}")
@@ -97,106 +183,87 @@ def scrape_web_content(url):
 # Function to clean and assign headers to a table
 def clean_and_assign_headers(df):
     """
-    Cleans the dataframe and assigns headers based on EXPECTED_HEADERS.
+    Cleans the dataframe by removing newline characters and assigns headers based on EXPECTED_HEADERS.
 
     Args:
         df (pd.DataFrame): The input dataframe to be cleaned and assigned headers.
 
     Returns:
-        pd.DataFrame: Cleaned dataframe with assigned headers.
+        pd.DataFrame: Cleaned dataframe with assigned headers, or None if the column count doesn't match.
     """
-    df = clean_newlines(df)
+    # Define the expected headers
+    EXPECTED_HEADERS = ["Programme", "Service", "Date of Transmission", "Issue", "Number of Complaints"]
+    print("count rows",len(df))
+    # Check if the number of columns matches the expected headers
+    if len(df.columns) != len(EXPECTED_HEADERS):
+        print(f"Column count mismatch: Expected {len(EXPECTED_HEADERS)}, but got {len(df.columns)}.")
+        return None
 
-    num_columns = len(df.columns)
-    expected_columns = len(EXPECTED_HEADERS)
+    # Assign the expected headers to the DataFrame
+    df.columns = EXPECTED_HEADERS
 
-    # If the DataFrame has fewer columns than expected, add placeholders
-    if num_columns < expected_columns:
-        logging.warning(
-            f"Table has {num_columns} columns, but expected {expected_columns}. Adding placeholder columns."
-        )
-        for i in range(num_columns, expected_columns):
-            df[f"Column_{i + 1}"] = None
-        num_columns = expected_columns  # Update num_columns after adding placeholders
+    # Function to clean newline characters from the data
+    def clean_newlines(series):
+        return series.apply(lambda x: x.replace("\n", " ") if isinstance(x, str) else x)
 
-    # If the DataFrame has more columns than expected, rename the extra columns
-    if num_columns > expected_columns:
-        logging.warning(
-            f"Table has {num_columns} columns, exceeding the expected {expected_columns}. Renaming extra columns."
-        )
-        extra_columns = [
-            f"Extra_Column_{i - expected_columns + 1}"
-            for i in range(expected_columns, num_columns)
-        ]
-        df.columns = EXPECTED_HEADERS + extra_columns
-    else:
-        df.columns = EXPECTED_HEADERS[:num_columns]
-
-    # Truncate the DataFrame if it still has more columns than expected
-    df = df.iloc[:, :expected_columns]
+    # Apply the newline cleaning function to each column
+    df = df.apply(clean_newlines)
 
     return df
 
 
 # Function to try matching unmatched URLs
 def match_unmatched_urls(cleaned_df, unmatched_links):
-    c = set()
-    unmatched_links_temp = unmatched_links.copy()
-    for url in unmatched_links:
-        if url in c:
-            continue
-        c.add(url)
-        print(f"Processing unmatched URL: {url}")
-        best_match_row = None
-        best_match_score = 0
-        url_text = url.lower()
+    """
+    Matches unmatched URLs to the most appropriate row in the DataFrame using fuzzy matching.
 
-        # First attempt: Fuzzy match against "Programme", "Service", "Date of Transmission" in the URL
-        for index, row in cleaned_df.iterrows():
-            row_text = " ".join(
-                map(
-                    str,
-                    [
-                        row.get("Programme", ""),
-                        row.get("Service", ""),
-                        row.get("Date of Transmission", ""),
-                    ],
-                )
-            ).lower()
-            match_score = difflib.SequenceMatcher(None, url_text, row_text).ratio()
+    Args:
+        cleaned_df (pd.DataFrame): DataFrame containing complaint data.
+        unmatched_links (list): List of URLs that need to be matched.
 
-            if match_score > best_match_score and match_score > 0.5:  # Threshold of 0.5
-                best_match_row = index
-                best_match_score = match_score
+    Returns:
+        pd.DataFrame: Updated DataFrame with matched URLs.
+        list: List of URLs that couldn't be matched.
+    """
+    # Set up logging
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-        if best_match_row is None:
-            # Second attempt: Scrape the web page and match its content
-            web_content = scrape_web_content(url)
+    # Function to fetch and process web content
+    def fetch_and_process(url):
+        try:
+            web_content = scrape_web_content(url).lower()
+            return url, web_content
+        except requests.RequestException as e:
+            logging.error(f"Error fetching {url}: {e}")
+            return url, ""
+    # Fetch web content concurrently
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_url = {executor.submit(fetch_and_process, url): url for url in unmatched_links}
+        for future in as_completed(future_to_url):
+            url, web_content = future.result()
+            if not web_content:
+                continue
+
+            # Prepare a list of potential matches
+            potential_matches = []
             for index, row in cleaned_df.iterrows():
-                row_text = " ".join(map(str, row)).lower()
-                match_score = difflib.SequenceMatcher(
-                    None, web_content, row_text
-                ).ratio()
+                row_text = " ".join(map(str, row.dropna().values)).lower()
+                match_score = fuzz.token_set_ratio(web_content, row_text)
+                potential_matches.append((index, match_score))
 
-                if match_score > best_match_score and match_score > 0.5:
-                    best_match_row = index
-                    best_match_score = match_score
+            # Find the best match above a certain threshold
+            best_match = max(potential_matches, key=lambda x: x[1], default=(None, 0))
+            best_match_index, best_match_score = best_match
 
-        if best_match_row is None:
-            # Third attempt: Best effort fuzzy match
-            for index, row in cleaned_df.iterrows():
-                row_text = " ".join(map(str, row)).lower()
-                match_score = difflib.SequenceMatcher(None, url_text, row_text).ratio()
+            if best_match_score > 70:  # Threshold can be adjusted
+                if pd.isna(cleaned_df.at[best_match_index, "URL"]):
+                    cleaned_df.at[best_match_index, "URL"] = url
+                    unmatched_links.remove(url)
+                    logging.info(f"Matched URL {url} to row {best_match_index} with score {best_match_score}")
+            else:
+                logging.info(f"No suitable match found for URL {url}")
 
-                if match_score > best_match_score:
-                    best_match_row = index
-                    best_match_score = match_score
-
-        # Assign the URL to the best matching row if found
-        if best_match_row is not None and pd.isna(cleaned_df.at[best_match_row, "URL"]):
-            cleaned_df.at[best_match_row, "URL"] = url
-            unmatched_links_temp.remove(url)
-    return cleaned_df, unmatched_links_temp
+    return cleaned_df, unmatched_links
 
 
 # Function to match URL to row based on bounding boxes
@@ -240,10 +307,6 @@ def match_url_to_row(
                     matched_links.append((cell_bbox, uri))
                     matched_uris.add(uri)
                     unmatched_links.discard(uri)
-
-                    logging.info(
-                        f"Matched link {uri} with cell bounding box {cell_bbox}"
-                    )
                     output.append(
                         {"row_id": row_id, "cell_bbox": cell_bbox, "link": uri}
                     )
@@ -284,9 +347,8 @@ outcome_pattern = re.compile(
 further_action_pattern = re.compile(r"Further action\s*\n(.*?)(?=\n|$)", re.DOTALL)
 
 
-def extract_info(pdf_path):
+def extract_info(pdf_path: str) -> List[Dict[str, Any]]:
     results = []
-
     # Open the PDF file
     with fitz.open(pdf_path) as pdf:
         text = ""
@@ -359,18 +421,17 @@ class BBCComplaintScraper:
                 self.MASTER_CSV_OUTPUT, index=False
             )
 
-    def process_page(self, page_number, base_url, category_name):
+    def process_page(self, page_number: int, base_url: str, category_name: str) -> Tuple[List[Dict[str, Any]], str]:
         url = base_url.format(page_number)
         if page_number > 100:
             return [], None
-        logging.info(f"Processing page {page_number} for category: {category_name}")
         try:
             response = requests.get(url, timeout=10)
             if response.status_code == 404:
                 return [], None
             response.raise_for_status()
             time.sleep(2)
-            soup = BeautifulSoup(response.content, "html.parser")
+            soup = BeautifulSoup(response.content, "lxml", from_encoding="utf-8")
             tile_items = soup.select(".tile")
             links = []
             if len(tile_items) < 4:
@@ -417,7 +478,6 @@ class BBCComplaintScraper:
 
     def _download_pdf(self, pdf_url, retries=3):
         local_filename = os.path.join(self.PDF_DIR, unquote(os.path.basename(pdf_url)))
-        logging.info(f"Attempting to download PDF: {pdf_url}")
         for attempt in range(retries):
             try:
                 response = requests.get(pdf_url, timeout=10, headers=headers)
@@ -436,7 +496,6 @@ class BBCComplaintScraper:
 
     def _scrape_web_content(self,full_url):
         try:
-            logging.info(f"Scraping web content from URL: {full_url}")
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36"
             }
@@ -445,7 +504,7 @@ class BBCComplaintScraper:
                 logging.warning(f"Non-200 status code received: {response.status_code}")
                 return "", None
             response.raise_for_status()
-            soup = BeautifulSoup(response.content, "html.parser")
+            soup = BeautifulSoup(response.content, "lxml")
 
             # Extract all text content from the page
             text = soup.get_text(separator=" ", strip=True)
@@ -487,7 +546,6 @@ class BBCComplaintScraper:
                     self.MASTER_CSV_OUTPUT, mode="a", header=False, index=False
                 )
 
-            logging.info("Row appended successfully to the master CSV.")
         except Exception as e:
             logging.error(f"Failed to append row to master CSV: {e}")
 
@@ -559,7 +617,9 @@ class BBCComplaintScraper:
             return element.get_text(strip=True).replace("\n"," ") if element else "N/A"
 
         # Extract Programme, Service, and Date of Transmission from title block
-        programme = soup.select_one(".block-bbc-contact-page-title")
+        programme = soup.select_one("#block-bbc-contact-page-title")
+        print("extract_information_html -> ",programme)
+        print(url)
         if programme:
             title_parts = [part.strip() for part in programme.get_text().split(",")]
             extracted_data["Programme"] = title_parts[0] if len(title_parts) > 0 else "N/A"
@@ -627,7 +687,6 @@ class BBCComplaintScraper:
         if pdf_url and "pdf" in pdf_url:
             pdf_file = self._download_pdf(pdf_url)
             if pdf_file:
-                print(pdf_file, url_html, pdf_url, item.get("time"), category_name)
                 self.extract_tables_from_pdf(
                     pdf_file, url_html, pdf_url, item.get("time"), category_name
                 )
@@ -661,13 +720,13 @@ class BBCComplaintScraper:
             if rows:
                 return
         row = self.extract_information_html(soup, full_url)
+        good =False
         if content:
             score, keywords, anti_keywords = self.keypaceFinder.relative_keywords_score(
                 content
             )
-            if "trans " in content:
-                print("content trans")
             if score > 0 :
+                good =True
                 self._append_to_master_csv(
                     {
                         "Programme": row.get("Programme", "N/A"),
@@ -687,142 +746,166 @@ class BBCComplaintScraper:
                         "row_index": "N/A",
                     }
                 )
-
-    # def extract_tables_from_pdf(self, pdf_file, url_html, pdf_url, time_item, category):
+        if not good:
+            pass
+            
     def extract_tables_from_pdf(self, pdf_file, url_html, pdf_url, time_item, category):
         try:
+            # Initialize variables
             tables = None
-            logging.info(f"Extracting tables from PDF: {pdf_file}")
             reader = PdfReader(pdf_file)
             pdf_links = self._extract_links_from_pdf(reader)
-            if  category != "recent-complaints":
-                # Attempt to read tables using Camelot in stream mode
-                tables = camelot.read_pdf(pdf_file, pages="all", flavor="stream")
+            all_text = ""
+            text_data = extract_text_from_pdf(reader, pdf_file)
 
-                # Retry with lattice mode if no tables found or column mismatch
-                if not tables:
-                    tables = camelot.read_pdf(pdf_file, pages="all", flavor="lattice")
-
-            if not tables or category == "recent-complaints":
-                c = extract_info(pdf_file)
-                print(c)
-                for page_num, page in enumerate(reader.pages):
-                    page_text = page.extract_text()
-                    score, keywords, anti_keywords = (
-                        self.keypaceFinder.relative_keywords_score(page_text)
-                    )
-                    # row_text = " ".join(map(str, row2.values)).replace("\n", " ")
-                    # score2, keywords2, anti_keywords = (
-                    #     self.keypaceFinder.relative_keywords_score(row_text)
-                    # )
-                    # score = max(score2,score)
+            # Track pages with extracted data
+            pages_with_data = set()
+            good = False
+            # Parse text segments and add data for pages with matches
+            if text_data:
+                segments = parse_programme_segments(text_data, pdf_file)
+                for segment in segments:
+                    score, keywords, anti_keywords = self.keypaceFinder.relative_keywords_score(segment["Text Between"])
                     if score > 0:
+                        good =True
+                        pages_with_data.add(segment["Page"])  # Track the page with extracted data
                         self._append_to_master_csv(
                             {
-                                "Programme": "N/A",
-                                "Service": "N/A",
-                                "Date of Transmission": "N/A",
-                                "Issue": "N/A",
+                                "Programme": segment.get("Programme", "N/A"),
+                                "Service": segment.get("Service", "N/A"),
+                                "Date of Transmission": segment.get("Date", "N/A"),
+                                "Issue": segment.get("Text Between", "N/A"),
                                 "Outcome": "N/A",
                                 "keywords": ", ".join(keywords),
                                 "Score": score,
-                                "type (HTML/PDF)": "PDF",
+                                "type (HTML/PDF)": "PDF_non_table",
                                 "url html": url_html,
                                 "url Pdf": pdf_url,
                                 "URL": "",
                                 "time": time_item,
                                 "item_time": "Unknown",
                                 "category": category,
-                                "Page": page_num,
-                                # "row_index": index,
+                                "Page": segment.get("Page", "N/A"),
+                                "row_index": "N/A",
                             }
                         )
-                return  # Exit if no tables are found
+                if segments:
+                    return
 
-            for table_num, table in enumerate(tables, start=1):
-                # Clean and assign headers, handling single-column tables as well
-                cleaned_df = clean_and_assign_headers(table.df)
-                cleaned_df["URL"] = None
+            # Extract all text from the PDF for backup scoring
+            for page in reader.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    all_text += page_text
 
-                # Skip processing if table columns still don’t match expected headers
-                if len(cleaned_df.columns) < len(EXPECTED_HEADERS):
-                    logging.warning(
-                        f"Skipping table in {pdf_file}: insufficient columns after retry."
-                    )
-                    continue
+            # Perform keyword scoring for the full text as a backup
+            score_backup, keywords_backup, anti_keywords_backup = self.keypaceFinder.relative_keywords_score(all_text)
 
-                # Get matched and unmatched links for each table row
-                matched_links, unmatched_links, matched_links_row_info = (
-                    match_url_to_row(table, pdf_links) or ([], [], [])
+            # Attempt to read tables using Camelot
+            try:
+                tables = camelot.read_pdf(
+                    pdf_file,
+                    pages="all",
+                    flavor="lattice",
+                    strip_text="\n",
                 )
+                # Fallback to stream mode if no tables found
+                if not tables or len(tables) == 0:
+                    tables = camelot.read_pdf(pdf_file, pages="all", flavor="stream")
+            except Exception as e:
+                logging.warning(f"Failed to read tables from {pdf_file} using Camelot: {e}")
+                tables = None
 
-                # Assign URLs to matched rows
-                for link_info in matched_links_row_info:
-                    row_id = link_info["row_id"]
-                    url = link_info["link"]
-                    if row_id < len(cleaned_df):
-                        cleaned_df.at[row_id, "URL"] = url
+            # Fallback: Parse text if no tables or incomplete extraction
+            if not tables or len(tables) == 0:
+                logging.info(f"No tables found in {pdf_file}. Attempting to extract data from text.")
+                for page_num, page in enumerate(reader.pages):
+                    if page_num in pages_with_data:  # Skip pages that already have data
+                        continue
+                    page_text = page.extract_text()
+                    if not page_text:
+                        continue
 
-                # Match any remaining unmatched URLs
-                cleaned_df, remaining_unmatched_links = match_unmatched_urls(
-                    cleaned_df, unmatched_links
-                )
-
-                # Process each row in cleaned_df for scoring
-                for index, row in cleaned_df.iterrows():
-                    row_text = " ".join(map(str, row.values)).replace("\n", " ")
-                    score, keywords, anti_keywords = (
-                        self.keypaceFinder.relative_keywords_score(row_text)
+                    # Use regex to extract structured data
+                    matches = re.findall(
+                        r"^(.*?),\s*(BBC [\w\s]+),\s*(\d{1,2}/\d{1,2}/\d{4}),\s*(.*?)\s*(Upheld|Not upheld|Resolved|Closed)$",
+                        page_text,
+                        re.MULTILINE,
                     )
-                    if score > 0:
-                        self._append_to_master_csv(
-                            {
-                                "Programme": row.get("Programme", "N/A"),
-                                "Service": row.get("Service", "N/A"),
-                                "Date of Transmission": row.get(
-                                    "Date of Transmission", "N/A"
-                                ),
-                                "Issue": row.get("Issue", "N/A"),
-                                "Outcome": row.get("Outcome", "N/A"),
-                                "keywords": ", ".join(keywords),
-                                "Score": score,
-                                "type (HTML/PDF)": "PDF",
-                                "url html": url_html,
-                                "url Pdf": pdf_url,
-                                "URL": row.get("URL", "N/A"),
-                                "time": time_item,
-                                "item_time": "Unknown",
-                                "category": category,
-                                "Page": table.page,
-                                "row_index": index,
-                            }
-                        )
-                    elif row.get("URL", False):
-                        content, soup = self._scrape_web_content(row.get("URL"))
-                        row2 = self.extract_information_html(soup, row.get("URL"))
-                        row_text = " ".join(map(str, row2.values)).replace("\n", " ")
-                        score, keywords, anti_keywords = (
-                            self.keypaceFinder.relative_keywords_score(row_text)
-                        )
-                        score2, keywords2, anti_keywords = (
-                            self.keypaceFinder.relative_keywords_score(content)
-                        )
-                        score = max(score,score2)
-                        keywords = set(keywords+keywords2)
+
+                    # Append matched rows
+                    for match in matches:
+                        programme, service, date, issue, outcome = match
+                        score, keywords, anti_keywords = self.keypaceFinder.relative_keywords_score(issue)
                         if score > 0:
+                            good =True
+                            pages_with_data.add(page_num)  # Mark the page as having data
                             self._append_to_master_csv(
                                 {
-                                    "Programme": row2.get("Programme", "N/A"),
-                                    "Service": row2.get("Service", "N/A"),
-                                    "Date of Transmission": row2.get(
-                                        "Date of Transmission", "N/A"
-                                    ),
-                                    "Issue": row2.get("Issue", "N/A"),
-                                    "Outcome": row2.get("Outcome", "N/A"),
+                                    "Programme": programme.strip(),
+                                    "Service": service.strip(),
+                                    "Date of Transmission": date.strip(),
+                                    "Issue": issue.strip(),
+                                    "Outcome": outcome.strip(),
                                     "keywords": ", ".join(keywords),
                                     "Score": score,
-                                    "type (HTML/PDF)": "HTML",
+                                    "type (HTML/PDF)": "PDF (Fallback)",
                                     "url html": url_html,
+                                    "url Pdf": pdf_url,
+                                    "URL": "",
+                                    "time": time_item,
+                                    "item_time": "Unknown",
+                                    "category": category,
+                                    "Page": page_num + 1,
+                                    "row_index": "N/A",
+                                }
+                            )
+            else:
+                # Process extracted tables
+                for table_num, table in enumerate(tables, start=1):
+                    # Clean and assign headers
+                    cleaned_df = clean_and_assign_headers(table.df)
+                    if cleaned_df is None:
+                        continue
+
+                    # Add a placeholder column for URLs
+                    cleaned_df["URL"] = None
+
+                    # Skip processing if table columns are insufficient
+                    if len(cleaned_df.columns) < len(self.EXPECTED_HEADERS):
+                        logging.warning(f"Skipping table in {pdf_file}: insufficient columns.")
+                        continue
+
+                    # Match URLs to rows and update the DataFrame
+                    matched_links, unmatched_links, matched_links_row_info = (
+                        match_url_to_row(table, pdf_links) or ([], [], [])
+                    )
+
+                    for link_info in matched_links_row_info:
+                        row_id = link_info["row_id"]
+                        url = link_info["link"]
+                        if row_id < len(cleaned_df):
+                            cleaned_df.at[row_id, "URL"] = url
+
+                    # Process each row in the DataFrame
+                    for index, row in cleaned_df.iterrows():
+                        row_text = " ".join(map(str, row.values)).replace("\n", " ")
+                        score, keywords, anti_keywords = self.keypaceFinder.relative_keywords_score(row_text)
+                        if score > 0:
+                            good= True
+                            pages_with_data.add(table.page - 1)  # Mark the page as having data
+                            self._append_to_master_csv(
+                                {
+                                    "Programme": row.get("Programme", "N/A"),
+                                    "Service": row.get("Service", "N/A"),
+                                    "Date of Transmission": row.get("Date of Transmission", "N/A"),
+                                    "Issue": row.get("Issue", "N/A"),
+                                    "Outcome": row.get("Outcome", "N/A"),
+                                    "keywords": ", ".join(keywords),
+                                    "Score": score,
+                                    "type (HTML/PDF)": "PDF",
+                                    "url html": url_html,
+                                    "url Pdf": pdf_url,
                                     "URL": row.get("URL", "N/A"),
                                     "time": time_item,
                                     "item_time": "Unknown",
@@ -831,9 +914,36 @@ class BBCComplaintScraper:
                                     "row_index": index,
                                 }
                             )
+                if good:
+                    return
+                # Append full-text backup score for pages without data
+                for page_num, page in enumerate(reader.pages):
+                    if page_num not in pages_with_data and score_backup > 0:
+                        self._append_to_master_csv(
+                            {
+                                "Programme": "N/A",
+                                "Service": "N/A",
+                                "Date of Transmission": "N/A",
+                                "Issue": "N/A",
+                                "Outcome": "N/A",
+                                "keywords": ", ".join(keywords_backup),
+                                "Score": score_backup,
+                                "type (HTML/PDF)": "PDF (Backup)",
+                                "url html": url_html,
+                                "url Pdf": pdf_url,
+                                "URL": "",
+                                "time": time_item,
+                                "item_time": "Unknown",
+                                "category": category,
+                                "Page": page_num + 1,
+                                "row_index": "N/A",
+                            }
+                        )
 
         except Exception as e:
             logging.error(f"Error processing PDF {pdf_file}: {e}")
+
+
 
     def main(self):
         categories = {

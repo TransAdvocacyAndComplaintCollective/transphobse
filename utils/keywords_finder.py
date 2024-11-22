@@ -92,7 +92,6 @@ class KeypaceFinder:
             return len(unique_keypaces), unique_keypaces, found_keypaces
 
         # Fallback to raw matching using find_keypaces2
-        logger.warning("No key phrases found in normalized text. Falling back to raw matching.")
         found_keypaces_raw = self.find_keypaces2(original_text)
         found_keypaces_only_raw = [phrase for phrase, _, _ in found_keypaces_raw]
         unique_keypaces_raw = list(set(found_keypaces_only_raw))  # Deduplicate
