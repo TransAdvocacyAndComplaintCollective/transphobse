@@ -14,6 +14,7 @@ import camelot
 import re
 from rapidfuzz import fuzz
 from utils.keywords_finder import KeypaceFinder
+import re
 
 headers = {
     "User-Agent": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0",
@@ -35,6 +36,24 @@ EXPECTED_HEADERS = ["Programme", "Service", "Date of Transmission", "Issue", "Ou
 def clean_newlines(df):
     return df.map(lambda x: x.replace("\n", " ") if isinstance(x, str) else x)
 
+# date_pattern
+# station_pattern
+# programme_pattern
+# Function to extract Stage 1 complaints
+def extract_stage1_complaints(text):
+    stage1_pattern = re.compile(
+        r"(?P<Programme>.+?)\s+(?P<Service>BBC\s\w+)\s+(?P<Date>\d{2}/\d{2}/\d{4})\s+(?P<Main_Issue>.+?)\s+(?P<Number_of_Complaints>\d+)",
+        # re.DOTALL
+    )
+    return [match.groupdict() for match in stage1_pattern.finditer(text)]
+
+# Function to extract Stage 2 complaints
+def extract_stage2_complaints(text):
+    stage2_pattern = re.compile(
+        r"(?P<Programme>.+?)\s+(?P<Service>BBC[\w\s]+)\s+(?P<Date>\d{2}/\d{2}/\d{4})\s+(?P<Issue>.+?)\s+(?P<Outcome>[A-z ]*)",
+        # re.DOTALL
+    )
+    return [match.groupdict() for match in stage2_pattern.finditer(text)]
 
 
 def extract_text_from_pdf(pdf_reader,pdf_path):
@@ -51,13 +70,22 @@ def extract_text_from_pdf(pdf_reader,pdf_path):
     return "\n".join(extracted_text)
 
 
+
+date_pattern = r"((Date withheld|\d{1,2}(?:\s*(?:and|-|–|&)\s*\d{1,2})?\s*[A-Za-z]+\s*\d{4})|\d{1,2}\s(Jan|Feb|Mar|Apr|May|Jun|Mar|Apr|Jun|Jul|Sep|Oct|Nov|Dec)\w+)"
+station_pattern = r"[^,]+"
+programme_pattern = r"[^,]+"
+
+
+
 def parse_programme_segments(text, pdf_path):
     """Parse text into segments based on programme patterns."""
-    # Define regex patterns
-    date_pattern = r"(((|\d{1,2}|(\d{1,2}[A-z ]*)\s(and|-|–|&)\s)?(\d{1,2} [A-z ]* \d{4}?|\d{1,2}? [A-z ]* \d{4})[a-z ]*)|Date withheld)"
-    station_pattern = r"[A-Za-z0-9&'/)(.’\- ]+"
-    programme_pattern = r"[A-Za-z0-9?&,:/“’”()\-'’ ]+"
 
+    # Define programme patterns
+    programme_pattern = r".*?"
+    station_pattern = r"(BBC [^,]+|Radio [^,]+|bbc\.co\.uk)"
+    date_pattern = r"\d{1,2} \w+ \d{4}"
+
+    # Patterns dictionary with regex definitions
     patterns = {
         "prog_station_date": re.compile(
             rf"^(?P<programme>{programme_pattern}),\s*(?P<station>{station_pattern}),\s*(?P<date>{date_pattern})$"
@@ -75,22 +103,51 @@ def parse_programme_segments(text, pdf_path):
             rf"^(?P<station>BBC Red Button(?: text service closure)?)$"
         ),
         "site": re.compile(
-            rf"^(?P<programme>{programme_pattern})\s+,bbc\.co\.uk$"
+            rf"^(?P<programme>{programme_pattern}),\s*bbc\.co\.uk$"
+        ),
+        "station_data": re.compile(
+            rf"^(?P<station>{station_pattern}),\s*(?P<date>{date_pattern})$"
+        ),
+        "prog_station_date_simple": re.compile(
+            r"^(?P<programme>.*?),\s*(?P<station>BBC [^,]+|Radio [^,]+|bbc\.co\.uk),\s*(?P<date>\d{1,2} \w+ \d{4})?$"
+        ),
+        "prog_station_date_simple2": re.compile(
+            r"^(?P<programme>.+?),\s*(?P<station>.+?)(?:,\s*(?P<date>\d{1,2} \w+ \d{4}))?$"
+        ),
+        "forgs": re.compile(
+            r"^(?P<programme>[^,])*,\s(?P<station>[^,])*, (?P<date>\d{1,2}\s[A-z]*\s\d{4})$"
+        ),
+        "forgs2": re.compile(
+            r"(?P<programme>[^,]*), (?P<station>[^,]*), (?P<date>\d{2}[^,]*\d{4})"
+        ),
+        "forgs3": re.compile(
+            r"(?P<programme>[^,]*), (?P<station>[^,]*), (?P<date>\d{2}[^,]*)"
+        ),
+        "forgs4": re.compile(
+            r"(?P<programme>[A-z ]*)  (?P<station>[A-z ]*)  (?P<date>\d*/\d*/\d*)"
         ),
     }
+    # Corrected fallback pattern
+    fallback_pattern = re.compile(
+        r"^(?P<programme>[^,\n]+),\s*(?P<station>[^,\n]+),\s*(?P<date>[0-9][^,\n]*)$"
+    )
 
     lines = text.split("\n")
     segments = []
     current_segment = None
 
+    buffer = []
     for line in lines:
         line = line.strip()
         if not line:
             continue  # Skip empty lines
 
+        buffer.append(line)
+        buffer_text = ' '.join(buffer)
+
         match = None
         for pattern_name, pattern in patterns.items():
-            match = pattern.match(line)
+            match = pattern.match(buffer_text)
             if match:
                 break
 
@@ -101,24 +158,38 @@ def parse_programme_segments(text, pdf_path):
 
             # Start a new segment
             current_segment = {
-                "Programme": match.group("programme").strip() if "programme" in match.groupdict() else None,
-                "Station": match.group("station").strip() if "station" in match.groupdict() else None,
-                "Date": match.group("date").strip() if "date" in match.groupdict() else None,
+                "Programme": match.group("programme").strip() if "programme" in match.groupdict() and match.group("programme") else None,
+                "Station": match.group("station").strip() if "station" in match.groupdict() and match.group("station") else None,
+                "Date": match.group("date").strip() if "date" in match.groupdict() and match.group("date") else None,
                 "Text Between": "",
                 "PDF Path": pdf_path,
+                "Page": "N/A",  # Placeholder; update if page info is available
             }
-        else:
-            # Accumulate text for the current segment
+            buffer = []  # Reset buffer
+        elif fallback_pattern.match(buffer_text):
+            # Fallback parsing
             if current_segment:
-                current_segment["Text Between"] += line + "\n"
+                segments.append(current_segment)
+
+            fallback_match = fallback_pattern.match(buffer_text)
+            current_segment = {
+                "Programme": fallback_match.group("programme").strip() if "programme" in fallback_match.groupdict() and fallback_match.group("programme") else None,
+                "Station": fallback_match.group("station").strip() if "station" in fallback_match.groupdict() and fallback_match.group("station") else None,
+                "Date": fallback_match.group("date").strip() if "date" in fallback_match.groupdict() and fallback_match.group("date") else None,
+                "Text Between": "",
+                "PDF Path": pdf_path,
+                "Page": "N/A",  # Placeholder; update if page info is available
+            }
+            buffer = []  # Reset buffer
+        else:
+            # Keep accumulating lines
+            continue
 
     # Append the last segment if it exists
     if current_segment:
         segments.append(current_segment)
 
     return segments
-
-
 
 # Function to check if two bounding boxes overlap
 from typing import Any, Dict, List, Tuple
@@ -461,7 +532,7 @@ class BBCComplaintScraper:
 
             return links, url
         except requests.RequestException as e:
-            logging.error(f"Failed to process page {page_number}: {e}")
+            logging.error(f"Failed to process page {page_number}, {base_url}: {e}")
         return [], None
 
     def _is_valid_bbc_url(self, url):
@@ -683,6 +754,7 @@ class BBCComplaintScraper:
             return None
 
     def process_item(self, item, url_html, category_name):
+        print(item)
         pdf_url = item.get("pdf_link")
         if pdf_url and "pdf" in pdf_url:
             pdf_file = self._download_pdf(pdf_url)
@@ -749,199 +821,311 @@ class BBCComplaintScraper:
         if not good:
             pass
             
-    def extract_tables_from_pdf(self, pdf_file, url_html, pdf_url, time_item, category):
+    def _deduplicate_rows(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Deduplicates the list of extracted rows based on key fields.
+
+        Args:
+            rows (List[Dict[str, Any]]): List of extracted rows.
+
+        Returns:
+            List[Dict[str, Any]]: Deduplicated list of rows.
+        """
+        df = pd.DataFrame(rows)
+
+        # Define the subset of columns to identify duplicates
+        subset = ["Programme", "Service", "Date of Transmission", "Issue", "Page"]
+
+        # Add a condition to handle "PDF (Backup)" rows differently
+        for index, row in df.iterrows():
+            if row["type (HTML/PDF)"] == "PDF (Backup)":
+                # Ensure that rows with "PDF (Backup)" are uniquely identified by `Page`
+                # If "Programme", "Service", etc., are missing, use only `Page` for deduplication
+                row["Programme"] = row["Programme"] or f"Page {row['Page']}"
+                row["Service"] = row["Service"] or f"Page {row['Page']}"
+                row["Date of Transmission"] = row["Date of Transmission"] or f"Page {row['Page']}"
+                row["Issue"] = row["Issue"] or f"Page {row['Page']}"
+
+        # Drop duplicates based on the updated subset
+        df_unique = df.drop_duplicates(subset=subset, keep='first')
+
+        # Reset the index for consistency
+        df_unique.reset_index(drop=True, inplace=True)
+
+        return df_unique.to_dict(orient='records')
+
+
+    def extract_tables_from_pdf(
+        self, pdf_file: str, url_html: str, pdf_url: str, time_item: str, category: str
+    ) -> None:
         try:
-            # Initialize variables
-            tables = None
             reader = PdfReader(pdf_file)
-            pdf_links = self._extract_links_from_pdf(reader)
-            all_text = ""
-            text_data = extract_text_from_pdf(reader, pdf_file)
+            print("_extract_links_from_pdf",pdf_file)
+            pdf_links = self._extract_links_from_pdf(reader)#
+            print("_extract_full_text",pdf_file)
+            all_text = self._extract_full_text(reader)#
+            print("_parse_text_segments",pdf_file)
+            segments = self._parse_text_segments(all_text, pdf_file)
 
-            # Track pages with extracted data
-            pages_with_data = set()
-            good = False
-            # Parse text segments and add data for pages with matches
-            if text_data:
-                segments = parse_programme_segments(text_data, pdf_file)
-                for segment in segments:
-                    score, keywords, anti_keywords = self.keypaceFinder.relative_keywords_score(segment["Text Between"])
-                    if score > 0:
-                        good =True
-                        pages_with_data.add(segment["Page"])  # Track the page with extracted data
-                        self._append_to_master_csv(
-                            {
-                                "Programme": segment.get("Programme", "N/A"),
-                                "Service": segment.get("Service", "N/A"),
-                                "Date of Transmission": segment.get("Date", "N/A"),
-                                "Issue": segment.get("Text Between", "N/A"),
-                                "Outcome": "N/A",
-                                "keywords": ", ".join(keywords),
-                                "Score": score,
-                                "type (HTML/PDF)": "PDF_non_table",
-                                "url html": url_html,
-                                "url Pdf": pdf_url,
-                                "URL": "",
-                                "time": time_item,
-                                "item_time": "Unknown",
-                                "category": category,
-                                "Page": segment.get("Page", "N/A"),
-                                "row_index": "N/A",
-                            }
-                        )
-                if segments:
-                    return
+            # Initialize a list to collect all extracted rows
+            all_extracted_rows = []
 
-            # Extract all text from the PDF for backup scoring
-            for page in reader.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    all_text += page_text
+            # 1. Process text segments
+            print("_process_text_segments",pdf_file)
+            extracted_from_segments = self._process_text_segments(
+                segments, pdf_file, url_html, pdf_url, time_item, category
+            )
+            # all_extracted_rows.extend(extracted_from_segments)
 
-            # Perform keyword scoring for the full text as a backup
-            score_backup, keywords_backup, anti_keywords_backup = self.keypaceFinder.relative_keywords_score(all_text)
+            # 2. Extract tables using Camelot
+            print("_extract_tables_with_camelot",pdf_file)
+            tables = self._extract_tables_with_camelot(pdf_file)
+            extracted_from_tables = self._process_extracted_tables(
+                tables, pdf_links, url_html, pdf_url, time_item, category
+            )
+            all_extracted_rows.extend(extracted_from_tables)
 
-            # Attempt to read tables using Camelot
-            try:
-                tables = camelot.read_pdf(
-                    pdf_file,
-                    pages="all",
-                    flavor="lattice",
-                    strip_text="\n",
+            # 3. Fallback regex extraction
+            print("_fallback_regex_extraction",pdf_file)
+            extracted_from_fallback = self._fallback_regex_extraction(
+                reader, all_text, url_html, pdf_url, time_item, category
+            )
+            all_extracted_rows.extend(extracted_from_fallback)
+            if len(all_extracted_rows) == 0:
+                # 4. Backup keyword scoring
+                extracted_from_backup = self._backup_keyword_scoring(
+                    all_text, reader, url_html, pdf_url, time_item, category
                 )
-                # Fallback to stream mode if no tables found
-                if not tables or len(tables) == 0:
-                    tables = camelot.read_pdf(pdf_file, pages="all", flavor="stream")
-            except Exception as e:
-                logging.warning(f"Failed to read tables from {pdf_file} using Camelot: {e}")
-                tables = None
+                all_extracted_rows.extend(extracted_from_backup)
 
-            # Fallback: Parse text if no tables or incomplete extraction
-            if not tables or len(tables) == 0:
-                logging.info(f"No tables found in {pdf_file}. Attempting to extract data from text.")
-                for page_num, page in enumerate(reader.pages):
-                    if page_num in pages_with_data:  # Skip pages that already have data
-                        continue
-                    page_text = page.extract_text()
-                    if not page_text:
-                        continue
+            # 5. Deduplicate extracted rows
+            unique_extracted_rows = self._deduplicate_rows(all_extracted_rows)
 
-                    # Use regex to extract structured data
-                    matches = re.findall(
-                        r"^(.*?),\s*(BBC [\w\s]+),\s*(\d{1,2}/\d{1,2}/\d{4}),\s*(.*?)\s*(Upheld|Not upheld|Resolved|Closed)$",
-                        page_text,
-                        re.MULTILINE,
-                    )
-
-                    # Append matched rows
-                    for match in matches:
-                        programme, service, date, issue, outcome = match
-                        score, keywords, anti_keywords = self.keypaceFinder.relative_keywords_score(issue)
-                        if score > 0:
-                            good =True
-                            pages_with_data.add(page_num)  # Mark the page as having data
-                            self._append_to_master_csv(
-                                {
-                                    "Programme": programme.strip(),
-                                    "Service": service.strip(),
-                                    "Date of Transmission": date.strip(),
-                                    "Issue": issue.strip(),
-                                    "Outcome": outcome.strip(),
-                                    "keywords": ", ".join(keywords),
-                                    "Score": score,
-                                    "type (HTML/PDF)": "PDF (Fallback)",
-                                    "url html": url_html,
-                                    "url Pdf": pdf_url,
-                                    "URL": "",
-                                    "time": time_item,
-                                    "item_time": "Unknown",
-                                    "category": category,
-                                    "Page": page_num + 1,
-                                    "row_index": "N/A",
-                                }
-                            )
-            else:
-                # Process extracted tables
-                for table_num, table in enumerate(tables, start=1):
-                    # Clean and assign headers
-                    cleaned_df = clean_and_assign_headers(table.df)
-                    if cleaned_df is None:
-                        continue
-
-                    # Add a placeholder column for URLs
-                    cleaned_df["URL"] = None
-
-                    # Skip processing if table columns are insufficient
-                    if len(cleaned_df.columns) < len(self.EXPECTED_HEADERS):
-                        logging.warning(f"Skipping table in {pdf_file}: insufficient columns.")
-                        continue
-
-                    # Match URLs to rows and update the DataFrame
-                    matched_links, unmatched_links, matched_links_row_info = (
-                        match_url_to_row(table, pdf_links) or ([], [], [])
-                    )
-
-                    for link_info in matched_links_row_info:
-                        row_id = link_info["row_id"]
-                        url = link_info["link"]
-                        if row_id < len(cleaned_df):
-                            cleaned_df.at[row_id, "URL"] = url
-
-                    # Process each row in the DataFrame
-                    for index, row in cleaned_df.iterrows():
-                        row_text = " ".join(map(str, row.values)).replace("\n", " ")
-                        score, keywords, anti_keywords = self.keypaceFinder.relative_keywords_score(row_text)
-                        if score > 0:
-                            good= True
-                            pages_with_data.add(table.page - 1)  # Mark the page as having data
-                            self._append_to_master_csv(
-                                {
-                                    "Programme": row.get("Programme", "N/A"),
-                                    "Service": row.get("Service", "N/A"),
-                                    "Date of Transmission": row.get("Date of Transmission", "N/A"),
-                                    "Issue": row.get("Issue", "N/A"),
-                                    "Outcome": row.get("Outcome", "N/A"),
-                                    "keywords": ", ".join(keywords),
-                                    "Score": score,
-                                    "type (HTML/PDF)": "PDF",
-                                    "url html": url_html,
-                                    "url Pdf": pdf_url,
-                                    "URL": row.get("URL", "N/A"),
-                                    "time": time_item,
-                                    "item_time": "Unknown",
-                                    "category": category,
-                                    "Page": table.page,
-                                    "row_index": index,
-                                }
-                            )
-                if good:
-                    return
-                # Append full-text backup score for pages without data
-                for page_num, page in enumerate(reader.pages):
-                    if page_num not in pages_with_data and score_backup > 0:
-                        self._append_to_master_csv(
-                            {
-                                "Programme": "N/A",
-                                "Service": "N/A",
-                                "Date of Transmission": "N/A",
-                                "Issue": "N/A",
-                                "Outcome": "N/A",
-                                "keywords": ", ".join(keywords_backup),
-                                "Score": score_backup,
-                                "type (HTML/PDF)": "PDF (Backup)",
-                                "url html": url_html,
-                                "url Pdf": pdf_url,
-                                "URL": "",
-                                "time": time_item,
-                                "item_time": "Unknown",
-                                "category": category,
-                                "Page": page_num + 1,
-                                "row_index": "N/A",
-                            }
-                        )
+            # 6. Append unique rows to the master CSV
+            for row in unique_extracted_rows:
+                self._append_to_master_csv(row)
 
         except Exception as e:
             logging.error(f"Error processing PDF {pdf_file}: {e}")
+
+
+    def _extract_full_text(self, reader: PdfReader) -> str:
+        """Extracts all text from the PDF."""
+        all_text = ""
+        for page in reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                all_text += page_text
+        return all_text
+
+    def _parse_text_segments(self, text: str, pdf_path: str) -> List[Dict[str, Any]]:
+        """Parses text into structured segments based on predefined patterns."""
+        segments = parse_programme_segments(text, pdf_path)
+        return segments
+
+    def _process_text_segments(
+        self,
+        segments: List[Dict[str, Any]],
+        pdf_file: str,
+        url_html: str,
+        pdf_url: str,
+        time_item: str,
+        category: str
+    ) -> List[Dict[str, Any]]:
+        extracted_rows = []
+        print(segments)
+        for segment in segments:
+            print(segment)
+            if segment["Text Between"] is None:
+                continue
+            score, keywords, anti_keywords = self.keypaceFinder.relative_keywords_score(segment["Text Between"])
+            if score > 0:
+                row = {
+                    "Programme": segment.get("Programme", "N/A"),
+                    "Service": segment.get("Service", "N/A"),
+                    "Date of Transmission": segment.get("Date", "N/A"),
+                    "Issue": segment.get("Text Between", "N/A"),
+                    "Outcome": "N/A",
+                    "keywords": ", ".join(keywords),
+                    "Score": score,
+                    "type (HTML/PDF)": "PDF_non_table",
+                    "url html": url_html,
+                    "url Pdf": pdf_url,
+                    "URL": "",
+                    "time": time_item,
+                    "item_time": "Unknown",
+                    "category": category,
+                    "Page": segment.get("Page", "N/A").replace("\n", " "),
+                    "row_index": "N/A",
+                }
+                extracted_rows.append(row)
+        return extracted_rows
+
+
+    def _extract_tables_with_camelot(self, pdf_file: str) -> List[camelot.core.Table]:
+        """Attempts to extract tables from the PDF using Camelot."""
+        try:
+            tables = camelot.read_pdf(
+                pdf_file,
+                pages="all",
+                flavor="lattice",
+                strip_text="\n",
+            )
+            if not tables:
+                tables = camelot.read_pdf(pdf_file, pages="all", flavor="stream")
+            return tables
+        except Exception as e:
+            logging.warning(f"Failed to read tables from {pdf_file} using Camelot: {e}")
+            return []
+
+    def _process_extracted_tables(
+        self,
+        tables: List[camelot.core.Table],
+        pdf_links: Dict[int, List[Dict[str, Any]]],
+        url_html: str,
+        pdf_url: str,
+        time_item: str,
+        category: str
+    ) -> List[Dict[str, Any]]:
+        extracted_rows = []
+        for table in tables:
+            cleaned_df = clean_and_assign_headers(table.df)
+            if cleaned_df is None:
+                continue
+
+            cleaned_df["URL"] = None  # Placeholder for URLs
+
+            matched_links, unmatched_links, matched_links_row_info = match_url_to_row(table, pdf_links)
+
+            # Assign URLs to DataFrame rows
+            for link_info in matched_links_row_info:
+                row_id = link_info["row_id"]
+                url = link_info["link"]
+                if row_id < len(cleaned_df):
+                    cleaned_df.at[row_id, "URL"] = url
+
+            # Process each row in the DataFrame
+            for index, row in cleaned_df.iterrows():
+                row_text = " ".join(map(str, row.values)).replace("\n", " ")
+                score, keywords, anti_keywords = self.keypaceFinder.relative_keywords_score(row_text)
+                if score > 0:
+                    extracted_row = {
+                        "Programme": row.get("Programme", "N/A"),
+                        "Service": row.get("Service", "N/A"),
+                        "Date of Transmission": row.get("Date of Transmission", "N/A"),
+                        "Issue": row.get("Issue", "N/A"),
+                        "Outcome": row.get("Outcome", "N/A"),
+                        "keywords": ", ".join(keywords),
+                        "Score": score,
+                        "type (HTML/PDF)": "PDF",
+                        "url html": url_html,
+                        "url Pdf": pdf_url,
+                        "URL": row.get("URL", "N/A"),
+                        "time": time_item,
+                        "item_time": "Unknown",
+                        "category": category,
+                        "Page": table.page,
+                        "row_index": index,
+                    }
+                    extracted_rows.append(extracted_row)
+        return extracted_rows
+
+    def _fallback_regex_extraction(
+        self,
+        reader: PdfReader,
+        all_text: str,
+        url_html: str,
+        pdf_url: str,
+        time_item: str,
+        category: str
+    ) -> List[Dict[str, Any]]:
+        extracted_rows = []
+        for page_num, page in enumerate(reader.pages):
+            page_text = page.extract_text()
+            if not page_text:
+                continue
+
+            matches = re.findall(
+                r"^(.*?),\s*(BBC [\w\s]+),\s*(\d{1,2}/\d{1,2}/\d{4}),\s*(.*?)\s*(Upheld|Not upheld|Resolved|Closed)$",
+                page_text,
+                re.MULTILINE,
+            )
+
+            for match in matches:
+                programme, service, date, issue, outcome = match
+                row_text = " ".join(match).replace("\n", " ")
+                score, keywords, anti_keywords = self.keypaceFinder.relative_keywords_score(row_text)
+                if score > 0:
+                    row = {
+                        "Programme": programme.strip(),
+                        "Service": service.strip(),
+                        "Date of Transmission": date.strip(),
+                        "Issue": issue.strip(),
+                        "Outcome": outcome.strip(),
+                        "keywords": ", ".join(keywords),
+                        "Score": score,
+                        "type (HTML/PDF)": "PDF (Fallback)",
+                        "url html": url_html,
+                        "url Pdf": pdf_url,
+                        "URL": "",
+                        "time": time_item,
+                        "item_time": "Unknown",
+                        "category": category,
+                        "Page": page_num + 1,
+                        "row_index": "N/A",
+                    }
+                    extracted_rows.append(row)
+        return extracted_rows
+
+    def _backup_keyword_scoring(
+        self,
+        all_text: str,
+        reader: PdfReader,
+        url_html: str,
+        pdf_url: str,
+        time_item: str,
+        category: str
+    ) -> List[Dict[str, Any]]:
+        extracted_rows = []
+        for page_num, page in enumerate(reader.pages):
+            text_page = page.extract_text()
+            score_backup, keywords_backup, anti_keywords_backup = self.keypaceFinder.relative_keywords_score(text_page)
+            if score_backup > 0:
+                row = {
+                    "Programme": "N/A",
+                    "Service": "N/A",
+                    "Date of Transmission": "N/A",
+                    "Issue": "N/A",
+                    "Outcome": "N/A",
+                    "keywords": ", ".join(keywords_backup),
+                    "Score": score_backup,
+                    "type (HTML/PDF)": "PDF (Backup)",
+                    "url html": url_html,
+                    "url Pdf": pdf_url,
+                    "URL": "",
+                    "time": time_item,
+                    "item_time": "Unknown",
+                    "category": category,
+                    "Page": page_num + 1,
+                    "row_index": "N/A",
+                }
+                extracted_rows.append(row)
+        return extracted_rows
+
+    def _append_to_master_csv(self, row_data: Dict[str, Any]) -> None:
+        """Appends a row of data to the master CSV with thread safety."""
+        try:
+            # Reorder the row data to match the master headers
+            ordered_row = {key: row_data.get(key, "N/A") for key in master_headers}
+
+            # Write the row to the CSV with a lock to prevent concurrent write issues
+            with self.csv_lock:
+                pd.DataFrame([ordered_row]).to_csv(
+                    self.MASTER_CSV_OUTPUT, mode="a", header=False, index=False
+                )
+
+        except Exception as e:
+            logging.error(f"Failed to append row to master CSV: {e}")
 
 
 
@@ -959,6 +1143,7 @@ class BBCComplaintScraper:
                 items, url_html = self.process_page(
                     page_number, base_url, category_name
                 )
+                print(items, url_html)
                 if not items:
                     break
                 for item in items:

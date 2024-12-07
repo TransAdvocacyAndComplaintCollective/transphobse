@@ -2,7 +2,7 @@ import sys
 import asyncio
 from SPARQLWrapper import SPARQLWrapper, JSON
 import utils.keywords as kw
-from meage_scrape import KeyPhraseFocusCrawler
+from meage_scrape import Crawler
 
 # Endpoint URL for the SPARQL query
 ENDPOINT_URL = "https://query.wikidata.org/sparql"
@@ -143,7 +143,7 @@ async def main():
     allowed_subdirs_cruel = start_urls
     keywords = kw.KEYWORDS
 
-    crawler = KeyPhraseFocusCrawler(
+    crawler = Crawler(
         start_urls=start_urls,
         feeds=[],
         name="UK_news_mage_scrape",
@@ -151,7 +151,6 @@ async def main():
         keywords=keywords,
         start_data=None,
         end_data=None,
-        exclude_lag=[],
         # exclude_subdirs_scrape=[],
         # allow_for_recruiting=False,
     )

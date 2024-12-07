@@ -109,10 +109,5 @@ def process_pdfs(pdf_folder, output_csv):
     else:
         print("No data extracted from the PDFs.")
 
-
-if __name__ == "__main__":
-    # Path to the folder containing PDF files
-    pdf_folder = "/home/lucy/Desktop/transphobse/data/bbc_complaint_pdfs"
-    output_csv = "./parsed_programmes.csv"
-
-    process_pdfs(pdf_folder, output_csv)
+ddd = extract_text_from_pdf ("/home/lucy/Desktop/transphobse/data/bbc_complaint_pdfs/7 - 20 June 2021.pdf")
+print(ddd)

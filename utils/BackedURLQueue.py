@@ -219,41 +219,26 @@ class BackedURLQueue:
         if row:
             return URLItem.from_row(row)
         return None
-
+    
     async def push(self, url_item: URLItem):
-        """Add a new URLItem to the queue if it doesn't already exist, or update it if it does."""
         try:
-            # Normalize the URL to ensure consistent formatting
             url_item.url = normalize_url(url_item.url)
-
-            # Convert URLItem instance to a dictionary to prepare for insertion or update
             data = url_item.to_dict()
-            placeholders = ", ".join(["?"] * len(data))  # Placeholder for each field
-            columns = ", ".join(data.keys())             # Column names for the SQL query
-            values = tuple(data.values())                # Actual values to insert or update
-
-            # Check if the URL already exists in the database
-            cursor = await self.conn.execute(
-                f"SELECT 1 FROM {self.table_name} WHERE url = ?", (url_item.url,)
+            placeholders = ", ".join(["?"] * len(data))
+            columns = ", ".join(data.keys())
+            values = tuple(data.values())
+    
+            await self.conn.execute(
+                f"""
+                INSERT OR REPLACE INTO {self.table_name} ({columns})
+                VALUES ({placeholders})
+                """,
+                values,
             )
-            exists = await cursor.fetchone()
-            await cursor.close()
-
-            if not exists:
-                # If URL does not exist, insert a new entry
-                await self.conn.execute(
-                    f"""
-                    INSERT INTO {self.table_name} ({columns})
-                    VALUES ({placeholders})
-                    """,
-                    values,
-                )
-
             await self.conn.commit()
-
         except aiosqlite.Error as e:
-            # Log the error if insertion or update fails
             logger.error(f"Failed to push or update URL {url_item.url}: {e}")
+
 
 
     async def pop(self) -> Optional[URLItem]:

@@ -46,7 +46,7 @@ async def main():
         allowed_subdirs=allowed_subdirs_cruel,
         start_date=start_data,
         end_date=end_data,
-        exclude_lag=exclude_lag,
+        # exclude_lag=exclude_lag,
         exclude_subdirs=exclude_subdirs_cruel,
         exclude_scrape_subdirs=exclude_subdirs_scrape
     )

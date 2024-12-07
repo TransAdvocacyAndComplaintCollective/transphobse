@@ -1,6 +1,6 @@
 import asyncio
 import os
-from meage_scrape import KeyPhraseFocusCrawler
+from meage_scrape import Crawler
 import utils.keywords as kw
 
 async def main():
@@ -36,7 +36,7 @@ async def main():
 
     ]
     allowed_subdirs_cruel = ["https://bbc.co.uk/news/","https://feeds.bbci.co.uk/news"]
-    crawler = KeyPhraseFocusCrawler(
+    crawler = Crawler(
         start_urls,
         feeds,
         "BBC_news_mage_scrape_cass",
