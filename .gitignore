@@ -7,3 +7,4 @@ node_modules
 databases
 databases
 databases/*
+databases/BBC_news_mage_scrape.db
