@@ -435,51 +435,51 @@ async def lookup_keyword(keyword: str, domain: Optional[str] = None) -> List[Dic
     all_results = duckduckgo_results + searx_results
     return all_results
 
-async def main():
-    """
-    Main function to perform searches and save results to a CSV file.
-    """
-    filtered_keywords = [kw for kw in keywords.KEYWORDS if len(kw) >= 6]
-    output_file = "data/search_results.csv"
+# # async def main():
+# #     """
+# #     Main function to perform searches and save results to a CSV file.
+# #     """
+# #     filtered_keywords = [kw for kw in keywords.KEYWORDS if len(kw) >= 6]
+# #     output_file = "data/search_results.csv"
 
-    try:
-        async with aiofiles.open(output_file, mode="a", newline="", encoding="utf-8") as file:
-            writer = csv.DictWriter(file, fieldnames=["link", "link_text", "keyword", "engine", "snippet", "date_published", "section", "summary"])
+# #     try:
+# #         async with aiofiles.open(output_file, mode="a", newline="", encoding="utf-8") as file:
+# #             writer = csv.DictWriter(file, fieldnames=["link", "link_text", "keyword", "engine", "snippet", "date_published", "section", "summary"])
             
-            # Write header if the file is empty
-            await file.seek(0, 2)  # Move to the end of the file
-            if await file.tell() == 0:
-                await file.write(','.join(writer.fieldnames) + '\n')
+# #             # Write header if the file is empty
+# #             await file.seek(0, 2)  # Move to the end of the file
+# #             if await file.tell() == 0:
+# #                 await file.write(','.join(writer.fieldnames) + '\n')
 
-            for keyword in filtered_keywords:
-                logging.info(f"Processing keyword: {keyword}")
+# #             for keyword in filtered_keywords:
+# #                 logging.info(f"Processing keyword: {keyword}")
 
-                # Perform searches
-                searx_news_results = await searx_search_news(keyword)
-                duckduckgo_results = await duckduckgo_search(keyword)
-                bbc_results = await bbc_search(keyword)
+# #                 # Perform searches
+# #                 searx_news_results = await searx_search_news(keyword)
+# #                 duckduckgo_results = await duckduckgo_search(keyword)
+# #                 bbc_results = await bbc_search(keyword)
 
-                # Combine all results
-                all_results = searx_news_results + duckduckgo_results + bbc_results
+# #                 # Combine all results
+# #                 all_results = searx_news_results + duckduckgo_results + bbc_results
 
-                # Write results to CSV
-                for result in all_results:
-                    await file.write(','.join([
-                        f"\"{result.get('link', '').replace('\"', '\"\"')}\"",
-                        f"\"{result.get('link_text', '').replace('\"', '\"\"')}\"",
-                        f"\"{result.get('keyword', '').replace('\"', '\"\"')}\"",
-                        f"\"{result.get('engine', '').replace('\"', '\"\"')}\"",
-                        f"\"{result.get('snippet', '').replace('\"', '\"\"')}\"",
-                        f"\"{result.get('date_published', '').replace('\"', '\"\"')}\"",
-                        f"\"{result.get('section', '').replace('\"', '\"\"')}\"",
-                        f"\"{result.get('summary', '').replace('\"', '\"\"')}\""
-                    ]) + '\n')
+# #                 # Write results to CSV
+# #                 # for result in all_results:
+# #                 #     await file.write(','.join([
+# #                 #         f"\"{result.get('link', '').replace('\"', '\"\"')}\"",
+# #                 #         f"\"{result.get('link_text', '').replace('\"', '\"\"')}\"",
+# #                 #         f"\"{result.get('keyword', '').replace('\"', '\"\"')}\"",
+# #                 #         f"\"{result.get('engine', '').replace('\"', '\"\"')}\"",
+# #                 #         f"\"{result.get('snippet', '').replace('\"', '\"\"')}\"",
+# #                 #         f"\"{result.get('date_published', '').replace('\"', '\"\"')}\"",
+# #                 #         f"\"{result.get('section', '').replace('\"', '\"\"')}\"",
+# #                 #         f"\"{result.get('summary', '').replace('\"', '\"\"')}\""
+# #                 #     ]) + '\n')
 
-                logging.info(f"Completed processing for keyword: {keyword}")
+# #                 # logging.info(f"Completed processing for keyword: {keyword}")
 
-        logging.info(f"CSV file saved as '{output_file}'")
-    except Exception as e:
-        logging.error(f"Error during CSV writing: {e}")
+# #         logging.info(f"CSV file saved as '{output_file}'")
+# #     except Exception as e:
+# #         logging.error(f"Error during CSV writing: {e}")
 
-if __name__ == "__main__":
-    asyncio.run(main())
+# if __name__ == "__main__":
+#     asyncio.run(main())
