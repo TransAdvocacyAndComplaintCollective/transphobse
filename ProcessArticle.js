@@ -16,6 +16,10 @@ function ProcessArticle(html, url) {
         const reader = new Readability(dom.window.document, { disableJSONLD: false });
         let article = reader.parse();
 
+        if (!article) {
+            throw new Error("Readability failed to parse the article.");
+        }
+
         // Sanitize the content using DOMPurify for security
         article.content = DOMPurify.sanitize(article.content);
 
@@ -30,6 +34,11 @@ function ProcessArticle(html, url) {
 // Read the URL from the command-line arguments
 const url = process.argv[2];
 
+if (!url) {
+    console.error("No URL provided. Usage: node ProcessArticle.js <URL>");
+    process.exit(1);
+}
+
 // Read the HTML content from stdin
 let html = '';
 process.stdin.setEncoding('utf8');
@@ -39,6 +48,11 @@ process.stdin.on('data', function(chunk) {
 });
 
 process.stdin.on('end', function() {
+    if (!html.trim()) {
+        console.error(`No HTML content received for URL: ${url}`);
+        process.exit(1);
+    }
+
     // Process the article after all data has been received
     const result = ProcessArticle(html, url);
     if (result) {

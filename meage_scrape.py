@@ -1,40 +1,35 @@
 import asyncio
-import csv
-import json
-import logging
-import math
-import multiprocessing
 import os
-import random
 import ssl
 import time
-from collections import defaultdict
+import math
+import orjson
+import logging
+import aiohttp
+import aiosqlite
+import feedparser
+import multiprocessing
+import signal
+import traceback
+from aiohttp import ClientSession
+from aiofiles import open as aio_open
+from aiocsv import AsyncDictWriter
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse, urlunparse, quote, unquote
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Set, Tuple
-from urllib.parse import urljoin, urlparse, urlunparse, quote, unquote
-import signal
-import aiofiles
-import aiohttp
-import aiodns
-import aiosqlite
-import certifi
-import chardet
-import feedparser
-import numpy as np
-from aiologger import Logger
-from aiologger.handlers.files import AsyncFileHandler
-from bs4 import BeautifulSoup
+from asyncio.subprocess import PIPE
 
-# Local imports
+# Local imports (Ensure these modules are correctly implemented)
 from utils.bbc_scripe_cdx import get_all_urls_cdx
 from utils.ovarit import ovarit_domain_scrape
 from utils.RobotsSql import RobotsSql
 from utils.BackedURLQueue import BackedURLQueue, URLItem
-from utils.keyword_search import  searx_search, searx_search_news
+from utils.keyword_search import searx_search, searx_search_news
 import utils.keywords as kw
 import utils.keywords_finder as kw_finder
 from utils.reddit import reddit_domain_scrape
-from aiocsv import  AsyncDictWriter
+
 # Attempt to use uvloop for faster event loop
 try:
     import uvloop
@@ -43,7 +38,12 @@ except ImportError:
     logging.warning("uvloop is not installed. Falling back to the default asyncio event loop.")
 
 # Initialize asynchronous logger
-logger = Logger.with_default_handlers(name=__name__, level=logging.INFO)
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+handler.setFormatter(formatter)
+logger.addHandler(handler)
 
 HEADERS = {
     "User-Agent": (
@@ -61,8 +61,8 @@ HEADERS = {
     "Sec-Fetch-Site": "none",
     "Sec-Fetch-User": "?1",
     "Sec-GPC": "1",
+    "Accept-Encoding": "gzip, deflate, br",
 }
-
 
 def normalize_url(url: str) -> str:
     """Standardize and clean URL format."""
@@ -92,8 +92,6 @@ def normalize_url(url: str) -> str:
         logger.error(f"Error normalizing URL {url}: {e}")
         return url  # Return the original URL if normalization fails
 
-
-
 class Crawler:
     def __init__(
         self,
@@ -114,22 +112,6 @@ class Crawler:
     ):
         """
         Initialize the crawler with necessary configurations.
-
-        Args:
-            start_urls (List[str]): Initial URLs to start crawling from.
-            feeds (List[str]): RSS feed URLs.
-            name (str): Name identifier for the crawler instance.
-            keywords (Optional[List[str]]): Keywords to search for.
-            anti_keywords (Optional[List[str]]): Keywords to exclude.
-            plugins (Optional[List[Any]]): Plugins to extend crawler functionality.
-            allowed_subdirs (Optional[List[str]]): Subdirectories to include.
-            start_date (Optional[str]): Start date for crawling.
-            end_date (Optional[str]): End date for crawling.
-            exclude_subdirs (Optional[List[str]]): Subdirectories to exclude.
-            exclude_scrape_subdirs (Optional[List[str]]): Subdirectories to exclude from scraping.
-            piloting (bool): Flag for piloting mode.
-            show_bar (bool): Flag to show progress bar.
-            find_new_site (bool): Flag to find new sites based on keywords.
         """
         self.start_urls = start_urls
         self.feeds = feeds
@@ -144,13 +126,13 @@ class Crawler:
         self.find_new_site = find_new_site
 
         # Configuration parameters
-        self.max_workers = min(self.cpu_cores * 5, 1000)  # Adjusted based on CPU cores
+        self.max_workers = min(self.cpu_cores * 5, 1000)
         self.concurrent_task_limit = 100  # Adjust based on system capabilities
         self.collect_csv_row_limit = self.cpu_cores * 2
 
-        # Piloting related (removed plotting variables)
+        # Piloting related
         self.piloting = piloting
-        self.show_bar = True
+        self.show_bar = show_bar
 
         # Semaphores for concurrency control
         self.semaphore = asyncio.Semaphore(self.concurrent_task_limit)
@@ -187,9 +169,13 @@ class Crawler:
         self.discovery_rate: List[int] = []
         self.exponential_phase = True
 
+        # Subprocess pool for article processing
+        self.process_article_semaphore = asyncio.Semaphore(50)  # Limit concurrent subprocesses
+        self.article_process_pool = asyncio.Queue(maxsize=1000)  # Queue to manage subprocess tasks
+
     async def initialize_db(self) -> None:
         """Set up the database and required tables."""
-        self.robots = RobotsSql(self.conn, self.thread_pool)
+        self.robots = RobotsSql(self.conn, table_name="robot_dict")
         self.urls_to_visit = BackedURLQueue(self.conn, table_name="urls_to_visit")
         await self.urls_to_visit.initialize()
         await self.robots.initialize()
@@ -212,69 +198,78 @@ class Crawler:
             "Crawled At",
         ]
         if not os.path.exists(self.output_csv) or os.path.getsize(self.output_csv) == 0:
-            async with aiofiles.open(self.output_csv, mode="w", newline="", encoding="utf-8") as csv_file:
+            async with aio_open(self.output_csv, mode="w", newline="", encoding="utf-8") as csv_file:
                 writer = AsyncDictWriter(csv_file, fieldnames=fieldnames)
                 await writer.writeheader()
 
     async def initialize_urls(self) -> None:
         """Seed the initial URLs into the queue if it's empty."""
         if await self.urls_to_visit.count_seen() > 0:
-            await logger.info("URLs have already been initialized.")
+            logger.info("URLs have already been initialized.")
             return
 
+        initial_tasks = []
         for url in self.start_urls:
-            await self.add_to_queue(url, "webpage", priority=0)
+            initial_tasks.append(self.add_to_queue(url, "webpage", priority=0))
         for feed in self.feeds:
-            await self.add_to_queue(feed, "feed", priority=0)
+            initial_tasks.append(self.add_to_queue(feed, "feed", priority=0))
+        await asyncio.gather(*initial_tasks)
 
     async def _scrape_related_domains(self) -> None:
         """
         Scrape related domains based on keywords and add them to the queue.
-
-        Args:
-            urls (List[str]): List of URLs to scrape related domains from.
         """
         if self.find_new_site:
+            related_tasks = []
             for keyword in self.keywords:
-                for result in await searx_search_news(keyword):
+                related_tasks.append(searx_search_news(keyword))
+            results = await asyncio.gather(*related_tasks, return_exceptions=True)
+            for res in results:
+                if isinstance(res, Exception):
+                    logger.error(f"Error during searx_search_news: {res}")
+                    continue
+                for result in res:
                     link = result.get("link")
                     if link:
                         score, _, _ = self.key_finder.relative_keywords_score(result.get("link_text", ""))
                         await self.add_to_queue(link, "webpage", min(score, 1))
 
+        related_domain_tasks = []
         for url in self.start_urls:
             parsed_url = urlparse(url)
             hostname = parsed_url.hostname
             if not hostname:
                 continue
 
-            async for domain in  reddit_domain_scrape(hostname):
+            related_domain_tasks.append(reddit_domain_scrape(hostname))
+            related_domain_tasks.append(ovarit_domain_scrape(hostname))
+
+        domain_results = await asyncio.gather(*related_domain_tasks, return_exceptions=True)
+        for res in domain_results:
+            if isinstance(res, Exception):
+                logger.error(f"Error during domain scraping: {res}")
+                continue
+            for domain in res:
                 await self.add_to_queue(domain[0], "webpage", priority=1)
 
-            async for domain in  ovarit_domain_scrape(hostname):
-                await self.add_to_queue(domain[0], "webpage", priority=1)
-
-            for keyword in self.keywords:
-                for result in await searx_search(keyword, url):
-                    if result.get("link_text") == "cached":
-                        continue
-                    score, _, _ = self.key_finder.relative_keywords_score(result.get("link_text", ""))
-                    await self.add_to_queue(result.get("link"), "webpage", min(score, 1))
-
-                for result in await searx_search_news(keyword, url):
-                    if result.get("link_text") == "cached":
-                        continue
-                    score, _, _ = self.key_finder.relative_keywords_score(result.get("link_text", ""))
-                    await self.add_to_queue(result.get("link"), "webpage", min(score, 1))
+        keyword_tasks = []
+        for keyword in self.keywords:
+            keyword_tasks.append(searx_search(keyword))
+            keyword_tasks.append(searx_search_news(keyword))
+        keyword_results = await asyncio.gather(*keyword_tasks, return_exceptions=True)
+        for res in keyword_results:
+            if isinstance(res, Exception):
+                logger.error(f"Error during keyword search: {res}")
+                continue
+            for result in res:
+                if result.get("link_text") == "cached":
+                    continue
+                score, _, _ = self.key_finder.relative_keywords_score(result.get("link_text", ""))
+                await self.add_to_queue(result.get("link"), "webpage", min(score, 1))
 
     async def add_to_queue(self, url: str, url_type: str, priority: int = 0) -> None:
         """
         Add a URL to the queue after normalization and validation.
-
-        Args:
-            url (str): The URL to add.
-            url_type (str): Type of the URL (e.g., 'webpage', 'feed').
-            priority (int, optional): Priority score for the URL. Defaults to 0.
         """
         try:
             normalized_url = normalize_url(url)
@@ -289,7 +284,7 @@ class Crawler:
             if any(normalized_url.startswith(subdir) for subdir in self.exclude_subdirs):
                 return
 
-            robot = await self.robots.get(normalized_url)
+            robot = await self.robots.get_robot_parser(normalized_url)
             if robot and not robot.can_fetch("*", normalized_url):
                 return
 
@@ -310,110 +305,73 @@ class Crawler:
             # Update the estimated total pages
             await self.update_estimated_total_pages(batch_number=len(self.discovery_rate))
         except Exception as e:
-            await logger.error(f"Failed to add URL to queue: {url} - Error: {e}")
+            logger.error(f"Failed to add URL to queue: {url} - Error: {e}")
 
     def is_valid_url(self, url: str) -> bool:
         """
         Check if a URL is valid.
-
-        Args:
-            url (str): The URL to validate.
-
-        Returns:
-            bool: True if valid, False otherwise.
         """
         parsed = urlparse(url)
         return all([parsed.scheme, parsed.netloc])
 
-    async def fetch_content(
-        self, session: aiohttp.ClientSession, url_item: URLItem
-    ) -> Tuple[Optional[str], Optional[str]]:
+    async def fetch_content(self, session: ClientSession, url_item: URLItem) -> Tuple[Optional[str], Optional[str]]:
         """
-        Fetch the content of a URL with retries and error handling.
-
-        Args:
-            session (aiohttp.ClientSession): The aiohttp session to use.
-            url_item (URLItem): The URL item to fetch.
-
-        Returns:
-            Tuple[Optional[str], Optional[str]]: The content and MIME type, or (None, None) on failure.
+        Fetch the content of a URL.
         """
         url = url_item.url
-        ssl_context = ssl.create_default_context(cafile=certifi.where())
         retries = 5
-        
+        backoff = 3
+        ssl_context = ssl.create_default_context(cafile=ssl.get_default_verify_paths().cafile)
 
         for attempt in range(retries):
             try:
-                async with session.get(url, ssl=ssl_context, timeout=60) as response:
+                async with session.get(url, ssl=ssl_context, timeout=30) as response:
                     if response.status == 200:
-                        content_bytes = await response.read()
-                        encoding = chardet.detect(content_bytes)["encoding"] or "utf-8"
-                        text = content_bytes.decode(encoding, errors="replace")
+                        text = await response.text(encoding='utf-8', errors='replace')
                         if text.strip():
-                            await self.urls_to_visit.update_status(url, "seen")
                             return text, response.headers.get("Content-Type", "")
-                        else:
-                            await logger.warning(f"Empty content for {url}")
-                            return None, None
                     elif response.status in {429, 503}:
-                        await logger.warning(f"Rate limited or service unavailable for {url}: {response.status}")
-                        await asyncio.sleep((2 ** (attempt + 1)) + random.uniform(0, 1))
-
+                        await asyncio.sleep(backoff)
+                        backoff *= 2
                     else:
-                        await logger.warning(f"Non-200 response for {url}: {response.status}")
                         return None, None
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                await logger.warning(f"Error fetching {url} on attempt {attempt + 1}: {e}")
-                await asyncio.sleep((2 ** (attempt + 1)) + random.uniform(0, 1))
+                logger.warning(f"Error fetching {url}: {e}. Retrying in {backoff} seconds.")
+                await asyncio.sleep(backoff)
+                backoff *= 2
             except Exception as e:
-                await logger.error(f"Unexpected error fetching {url}: {e}")
-                break
+                logger.error(f"Unexpected error fetching {url}: {e}")
+                return None, None
 
-        await self.urls_to_visit.update_status(url, "error")
         return None, None
 
     async def process_article(self, html: str, url: str) -> Dict[str, Any]:
         """
-        Process the article using an external Node.js script.
-
-        Args:
-            html (str): The HTML content of the article.
-            url (str): The URL of the article.
-
-        Returns:
-            Dict[str, Any]: The processed article data.
+        Process the article using a subprocess.
         """
-        try:
-            # async with self.semaphore:
+        async with self.process_article_semaphore:
+            try:
                 process = await asyncio.create_subprocess_exec(
                     "node",
                     "utils/ProcessArticle.js",
                     url,
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+                    stdin=PIPE,
+                    stdout=PIPE,
+                    stderr=PIPE,
                 )
-
                 stdout, stderr = await process.communicate(input=html.encode("utf-8"))
-
                 if process.returncode == 0:
-                    return json.loads(stdout.decode("utf-8"))
+                    return orjson.loads(stdout.decode("utf-8"))
                 else:
-                    await logger.error(f"Error processing article {url}: {stderr.decode('utf-8')}")
+                    logger.error(f"Error processing article {url}: {stderr.decode('utf-8')}")
                     return {}
-        except Exception as e:
-            await logger.exception(f"Exception occurred while processing article {url}: {e}")
-            return {}
+            except Exception as e:
+                logger.exception(f"Exception occurred while processing article {url}: {e}")
+                return {}
 
     async def process_content(self, url_item: URLItem, text: str, mime: str) -> None:
         """
         Process the fetched content based on MIME type.
-
-        Args:
-            url_item (URLItem): The URL item being processed.
-            text (str): The content of the URL.
-            mime (str): The MIME type of the content.
         """
         if "application/rss+xml" in mime or url_item.page_type == "feed":
             await self.process_feed(text, url_item.url)
@@ -423,14 +381,11 @@ class Crawler:
             await self.analyze_webpage_content(text, url_item)
         else:
             await self.urls_to_visit.update_error(url_item.url, f"Unsupported MIME type: {mime}")
-            await logger.warning(f"Unsupported MIME type for {url_item.url}: {mime}")
+            logger.warning(f"Unsupported MIME type for {url_item.url}: {mime}")
 
     async def update_estimated_total_pages(self, batch_number: int) -> None:
         """
         Update the estimated total number of pages using a growth model.
-
-        Args:
-            batch_number (int): The current batch number.
         """
         current_links = self.total_discovered_links
 
@@ -442,7 +397,7 @@ class Crawler:
                 overall_rate = sum(self.discovery_rate) / len(self.discovery_rate)
                 if recent_rate < 0.8 * overall_rate:
                     self.exponential_phase = False
-                    await logger.info("Switching to logistic growth phase for estimation.")
+                    logger.info("Switching to logistic growth phase for estimation.")
         else:
             L = self.estimated_total_pages
             k = self.growth_rate
@@ -451,20 +406,6 @@ class Crawler:
             estimated_total = L / (1 + math.exp(-k * (t - t0)))
 
         self.estimated_total_pages = int(round(max(self.estimated_total_pages, estimated_total)))
-
-        # Log the estimated total pages
-        # await logger.info(f"Estimated total pages: {self.estimated_total_pages}")
-
-    def update_discovery_rate(self, extracted_links_count: int) -> None:
-        """
-        Update the discovery rate metrics.
-
-        Args:
-            extracted_links_count (int): Number of links extracted in the current batch.
-        """
-        self.discovery_rate.append(extracted_links_count)
-        if len(self.discovery_rate) > 10:
-            self.discovery_rate.pop(0)
 
     async def analyze_webpage_content(self, text: str, url_item: URLItem, metadata: Optional[Dict[str, Any]] = None) -> None:
         """
@@ -477,19 +418,15 @@ class Crawler:
                 return
 
             article = await self.process_article(text, url_item.url)
-            result = await asyncio.get_event_loop().run_in_executor(
-                self.thread_pool,
-                self._analyze_webpage_content_sync,
-                text,
-                url_item,
-                article,  # Removed 'metadata' from here
-            )
-
-            if result is None:
+            if not article:
                 await self.urls_to_visit.mark_seen(url_item.url)
                 return
 
-            score, keywords, links_to_queue, canonical_url, metadata = result
+            score, keywords, links_to_queue, canonical_url, metadata = await self._analyze_webpage_content_sync(text, url_item, article)
+
+            if score is None:
+                await self.urls_to_visit.mark_seen(url_item.url)
+                return
 
             # Update discovery metrics
             self.update_discovery_metrics(len(links_to_queue))
@@ -498,27 +435,25 @@ class Crawler:
             await self.update_estimated_total_pages(batch_number=len(self.discovery_rate))
 
             # Add discovered links to the queue
-            for link_info in links_to_queue:
-                await self.add_to_queue(*link_info)
+            add_tasks = [self.add_to_queue(*link_info) for link_info in links_to_queue]
+            await asyncio.gather(*add_tasks, return_exceptions=True)
 
             # Handle canonical URL
             if canonical_url and url_item.url != canonical_url:
                 await self.add_to_queue(canonical_url, "webpage", priority=score)
 
             await self.urls_to_visit.mark_seen(url_item.url)
-
             # Collect CSV row if score is positive
             if score > 0:
                 await self.urls_to_visit.set_page_score(url_item.url, score)
                 await self.collect_csv_row(url_item, score, keywords, metadata)
         except Exception as e:
-            await logger.exception(f"Error in analyze_webpage_content for {url_item.url}: {e}")
+            logger.exception(f"Error in analyze_webpage_content for {url_item.url}: {e}")
             await self.urls_to_visit.update_error(url_item.url, str(e))
 
-
-    def _analyze_webpage_content_sync(
+    async def _analyze_webpage_content_sync(
         self, text: str, url_item: URLItem, article: Dict[str, Any]
-    ) -> Optional[Tuple[float, List[str], List[Tuple[str, str, float]], Optional[str]]]:
+    ) -> Optional[Tuple[float, List[str], List[Tuple[str, str, float]], Optional[str], Dict[str, Any]]]:
         """
         Synchronous method to analyze webpage content.
         """
@@ -570,29 +505,6 @@ class Crawler:
             logger.error(f"Failed to extract metadata for {url}: {e}")
         return metadata
 
-    def _merge_jsonld_data(self, target: Dict[str, Any], source: Dict[str, Any]) -> None:
-        """
-        Helper function to merge JSON-LD data into the target dictionary.
-
-        Args:
-            target (Dict[str, Any]): The target dictionary.
-            source (Dict[str, Any]): The source JSON-LD data.
-        """
-        for key, value in source.items():
-            if key == "@type" and isinstance(value, str):
-                value = [value]
-
-            if isinstance(target.get(key), list) and isinstance(value, list):
-                target[key].extend(value)
-            elif isinstance(target.get(key), list):
-                target[key].append(value)
-            elif isinstance(value, list):
-                target[key] = [target.get(key, ""), *value]
-            elif key in target:
-                target[key] = [target[key], value]
-            else:
-                target[key] = value
-
     def extract_json_ld(self, bs: BeautifulSoup) -> Optional[Dict[str, Any]]:
         """
         Extract JSON-LD data from HTML.
@@ -601,14 +513,14 @@ class Crawler:
             scripts = bs.find_all("script", type="application/ld+json")
             for script in scripts:
                 try:
-                    data = json.loads(script.string or "{}")
+                    data = orjson.loads(script.get_text() or "{}")
                     if isinstance(data, list):
                         for item in data:
                             if isinstance(item, dict):
                                 return item
                     elif isinstance(data, dict):
                         return data
-                except json.JSONDecodeError:
+                except orjson.JSONDecodeError:
                     logger.warning("JSON-LD extraction failed due to JSON decoding error.")
         except Exception as e:
             logger.error(f"Error extracting JSON-LD: {e}")
@@ -617,12 +529,6 @@ class Crawler:
     def extract_microdata(self, bs: BeautifulSoup) -> Dict[str, Any]:
         """
         Extract microdata from HTML.
-
-        Args:
-            bs (BeautifulSoup): Parsed HTML content.
-
-        Returns:
-            Dict[str, Any]: Extracted microdata.
         """
         microdata_items = {}
         try:
@@ -632,7 +538,7 @@ class Crawler:
                     prop_value = tag["content"] if tag.has_attr("content") else tag.get_text(strip=True)
                     microdata_items[prop_name] = prop_value
         except Exception as e:
-            asyncio.create_task(logger.error(f"Error extracting microdata: {e}"))
+            logger.error(f"Error extracting microdata: {e}")
         return microdata_items
 
     async def collect_csv_row(
@@ -640,12 +546,6 @@ class Crawler:
     ) -> None:
         """
         Collect data for CSV output asynchronously.
-
-        Args:
-            url_item (URLItem): The URL item being processed.
-            score (float): The score assigned to the URL.
-            keywords (List[str]): Keywords found in the content.
-            metadata (Dict[str, Any]): Extracted metadata.
         """
         root_url = urlparse(url_item.url).netloc
         crawled_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
@@ -660,7 +560,7 @@ class Crawler:
             "Date Modified": metadata.get("dateModified", ""),
             "Author": metadata.get("author", ""),
             "Byline": metadata.get("byline", ""),
-            "Type": metadata.get("@type", ""),
+            "Type": metadata.get("type", ""),
             "Crawled At": crawled_at,
         }
 
@@ -674,185 +574,164 @@ class Crawler:
         if not self.csv_rows:
             return
         try:
-            async with aiofiles.open(self.output_csv, mode="a", newline="", encoding="utf-8") as csv_file:
+            async with aio_open(self.output_csv, mode="a", newline="", encoding="utf-8") as csv_file:
                 writer = AsyncDictWriter(csv_file, fieldnames=self.csv_rows[0].keys())
-                for row in self.csv_rows:
-                    await writer.writerow(row)
+                await writer.writerows(self.csv_rows)
             self.csv_rows.clear()
         except Exception as e:
-            await logger.error(f"Failed to write to CSV: {e}")
+            logger.error(f"Failed to write to CSV: {e}")
 
     async def process_feed(self, text: str, url: str) -> None:
         """
         Process RSS feed content.
-
-        Args:
-            text (str): The RSS feed content.
-            url (str): The URL of the feed.
         """
         feed = feedparser.parse(text)
+        add_tasks = []
         for entry in feed.entries:
             score, keywords, _ = self.key_finder.relative_keywords_score(entry.title)
-            await self.add_to_queue(entry.link, "webpage", priority=score)
+            add_tasks.append(self.add_to_queue(entry.link, "webpage", priority=score))
+        await asyncio.gather(*add_tasks, return_exceptions=True)
 
     async def process_sitemap(self, text: str, url: str) -> None:
         """
         Process sitemap XML content.
-
-        Args:
-            text (str): The sitemap XML content.
-            url (str): The URL of the sitemap.
         """
-        bs = BeautifulSoup(text, "lxml")  # Use 'lxml' parser for speed
+        bs = BeautifulSoup(text, "lxml")
         urls = [loc.text for loc in bs.find_all("loc")]
-        for link in urls:
-            await self.add_to_queue(link, "webpage")
+        add_tasks = [self.add_to_queue(link, "webpage") for link in urls]
+        await asyncio.gather(*add_tasks, return_exceptions=True)
 
     def update_discovery_metrics(self, links_to_queue_count: int) -> None:
         """
         Update discovery metrics based on the number of links queued.
-
-        Args:
-            links_to_queue_count (int): Number of links added to the queue.
         """
         self.total_discovered_links += links_to_queue_count
         if self.total_discovered_links > 0:
             self.average_links_per_page = (
                 (self.average_links_per_page + links_to_queue_count) / 2
             )
+        self.discovery_rate.append(links_to_queue_count)
+        if len(self.discovery_rate) > 10:
+            self.discovery_rate.pop(0)
 
     async def crawl_main(self) -> None:
         """Main crawling loop."""
-        connector = aiohttp.TCPConnector(limit=1000, ssl=False, keepalive_timeout=300,limit_per_host=5)
+        connector = aiohttp.TCPConnector(
+            limit=1000,
+            ssl=False,
+            keepalive_timeout=300,
+            limit_per_host=10,
+        )
         async with aiohttp.ClientSession(connector=connector, headers=HEADERS) as session:
             await self._crawl_loop(session)
+
+    async def _crawl_loop(self, session: aiohttp.ClientSession) -> None:
+        """
+        Main loop for crawling with adaptive Q-learning.
+        """
+        item_count = 0
+        start_time = time.time()
+
+        while not  await self.urls_to_visit.empty():  # Await unnecessary here for `queue.empty()`
+            urls = []
+
+            # Collect URLs to process
+            async for url_item in self._url_generator():
+                item_count += 1
+                urls.append(url_item)
+                if len(urls) >= self.concurrent_task_limit:
+                    break
+                
+            if not urls:  # Break if no URLs are collected
+                break
+            
+            # Create and gather fetch tasks
+            tasks = [self.fetch_and_process_url(url_item, session) for url_item in urls]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Handle exceptions from tasks
+            for idx, result in enumerate(results):
+                if isinstance(result, Exception):
+                    logger.error(f"Error processing URL {urls[idx]}: {result}")
+
+            # Log progress
+            if self.show_bar:
+                now_time = time.time()
+                time_elapsed = now_time - start_time
+                avg_time_per_page = time_elapsed / item_count if item_count > 0 else 0
+                # pages_left = await self.urls_to_visit.qsize()
+                # estimated_time_left = avg_time_per_page * pages_left
+
+                logger.info(f"Crawled {len(urls)} URLs. Total discovered links: {self.total_discovered_links}")
+                logger.info(f"Time elapsed: {time_elapsed:.2f} seconds")
+                logger.info(f"Pages per second: {1 / avg_time_per_page:.2f}" if avg_time_per_page > 0 else "N/A")
 
     async def _url_generator(self):
         """Generator to yield URLs from the queue."""
         while not await self.urls_to_visit.empty():
             url_item = await self.urls_to_visit.pop()
             if url_item:
-                await self.urls_to_visit.mark_processing(url_item.url)
                 yield url_item
-
-    async def fetch_and_process(self, session: aiohttp.ClientSession, tasks: Set[asyncio.Task]) -> int:
-        """
-        Fetch and process tasks, handling completed ones.
-
-        Args:
-            session (aiohttp.ClientSession): The aiohttp session to use.
-            tasks (Set[asyncio.Task]): The set of ongoing tasks.
-
-        Returns:
-            int: Number of completed tasks.
-        """
-        if tasks:
-            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            completed_tasks = len(done)
-            tasks.difference_update(done)
-            return completed_tasks
-        else:
-            return 0
-
-    async def _crawl_loop(self, session: aiohttp.ClientSession) -> None:
-        """
-        Main loop for crawling with adaptive Q-learning.
-
-        Args:
-            session (aiohttp.ClientSession): The aiohttp session to use.
-        """
-        if await self.urls_to_visit.empty():
-            await logger.info("No URLs left to visit. Exiting crawl loop.")
-            return
-
-        start_time = time.time()
-        tasks: Set[asyncio.Task] = set()
-        batch_number = 0
-
-        if self.show_bar:
-            try:
-                from tqdm.asyncio import tqdm_asyncio
-                pbar = tqdm_asyncio(
-                    total=max(await self.urls_to_visit.count_all(), self.estimated_total_pages),
-                    desc="Crawling Progress",
-                    unit="url",
-                )
-            except ImportError:
-                await logger.warning("tqdm not installed. Progress bar will not be shown.")
-                pbar = None
-        else:
-            pbar = None
-
-        while not await self.urls_to_visit.empty() or tasks:
-            batch_size = self.concurrent_task_limit
-
-            async for url_item in self._url_generator():
-                task = asyncio.create_task(self.fetch_and_process_url(url_item, session))
-                tasks.add(task)
-                if len(tasks) >= batch_size:
-                    break
-
-            completed_tasks = await self.fetch_and_process(session, tasks)
-
-            if completed_tasks > 0:
-                if self.show_bar and pbar is not None:
-                    try:
-                        current_total = max(await self.urls_to_visit.count_all(), self.estimated_total_pages)
-                        pbar.total = current_total
-                        pbar.update(completed_tasks)
-                    except Exception as e:
-                        await logger.error(f"Error updating progress bar: {e}")
-
-                time_taken = time.time() - start_time
-
-                # Reset for next batch
-                start_time = time.time()
-                batch_number += 1
-
-        if self.show_bar and pbar is not None:
-            pbar.close()
-
-    def calculate_reward(self, completed_tasks: int, time_taken: float, memory_in_bytes: int) -> float:
-        """
-        Calculate a simple reward metric.
-
-        Args:
-            completed_tasks (int): Number of completed tasks.
-            time_taken (float): Time taken for the batch.
-            memory_in_bytes (int): Memory usage in bytes.
-
-        Returns:
-            float: Calculated reward.
-        """
-        try:
-            memory_in_mb = memory_in_bytes / (1024 ** 2)
-            reward = (completed_tasks / max(time_taken, 1e-6)) * np.exp(-memory_in_mb / 100)
-            return reward
-        except Exception as e:
-            asyncio.create_task(logger.error(f"Error calculating reward: {e}"))
-            return 0.0
+            else:
+                break
 
     async def fetch_and_process_url(self, url_item: URLItem, session: aiohttp.ClientSession) -> None:
         """
         Fetch and process a single URL.
-
-        Args:
-            url_item (URLItem): The URL item to process.
-            session (aiohttp.ClientSession): The aiohttp session to use.
         """
         if not url_item:
             return
 
         try:
-            # async with self.semaphore:
             text, mime = await self.fetch_content(session, url_item)
             if text:
                 await self.process_content(url_item, text, mime)
             else:
-                await logger.error(f"Empty content for {url_item.url}")
+                await self.urls_to_visit.update_error(url_item.url, "Empty content or unsupported status code.")
+                logger.error(f"Empty content for {url_item.url}")
         except Exception as e:
-            await logger.exception(f"Error processing {url_item.url}: {e}")
+            logger.exception(f"Error processing {url_item.url}: {e}")
+            await self.urls_to_visit.update_error(url_item.url, str(e))
 
+    async def collect_csv_row(
+        self, url_item: URLItem, score: float, keywords: List[str], metadata: Dict[str, Any]
+    ) -> None:
+        """
+        Collect data for CSV output asynchronously.
+        """
+        root_url = urlparse(url_item.url).netloc
+        crawled_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        row = {
+            "Root Domain": root_url,
+            "URL": url_item.url,
+            "Score": score,
+            "Keywords Found": ", ".join(keywords),
+            "Headline": metadata.get("headline"),
+            "Name": metadata.get("name"),
+            "Date Published": metadata.get("datePublished", ""),
+            "Date Modified": metadata.get("dateModified", ""),
+            "Author": metadata.get("author", ""),
+            "Byline": metadata.get("byline", ""),
+            "Type": metadata.get("type", ""),
+            "Crawled At": crawled_at,
+        }
+
+        async with self.lock:
+            self.csv_rows.append(row)
+            if len(self.csv_rows) >= self.collect_csv_row_limit:
+                await self.write_to_csv()
+
+    async def write_to_csv(self) -> None:
+        """Asynchronously write collected CSV rows to the file."""
+        if not self.csv_rows:
+            return
+        try:
+            async with aio_open(self.output_csv, mode="a", newline="", encoding="utf-8") as csv_file:
+                writer = AsyncDictWriter(csv_file, fieldnames=self.csv_rows[0].keys())
+                await writer.writerows(self.csv_rows)
+            self.csv_rows.clear()
+        except Exception as e:
+            logger.error(f"Failed to write to CSV: {e}")
 
     async def crawl_start(self):
         """Start the crawling process."""
@@ -868,13 +747,12 @@ class Crawler:
             loop = asyncio.get_running_loop()
             stop_event = asyncio.Event()
 
-            # for sig in (signal.SIGINT, signal.SIGTERM):
-            #     loop.add_signal_handler(sig, lambda: asyncio.create_task(stop_event.set()))
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, lambda: asyncio.create_task(stop_event.set()))
 
             crawl_task = asyncio.create_task(self.crawl_main())
             stop_event_task = asyncio.create_task(stop_event.wait())
 
-            # Use tasks explicitly in asyncio.wait
             done, pending = await asyncio.wait(
                 [crawl_task, stop_event_task],
                 return_when=asyncio.FIRST_COMPLETED
@@ -888,46 +766,42 @@ class Crawler:
                 crawl_task.cancel()
                 await self.handle_shutdown()
 
-        await logger.shutdown()
+        logger.info("Crawling process completed.")
+        await self.handle_shutdown()
 
-    
     async def handle_shutdown(self):
         """Handle shutdown procedures."""
-        await self.urls_to_visit.close()
-        await self.conn.close()
-    async def log_parameters(self, batch_number: int, reward: float) -> None:
-        """
-        Log the current parameters for the batch.
-
-        Args:
-            batch_number (int): The current batch number.
-            reward (float): The calculated reward for the batch.
-        """
-
-    def get_memory_usage(self) -> int:
-        """
-        Get current memory usage in bytes. Cross-platform.
-
-        Returns:
-            int: Memory usage in bytes.
-        """
-        try:
-            import resource
-
-            return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024  # Unix
-        except ImportError:
-            try:
-                import psutil
-
-                process = psutil.Process(os.getpid())
-                return process.memory_info().rss  # Bytes
-            except ImportError:
-                asyncio.create_task(logger.error("psutil is not installed. Cannot get memory usage."))
-                return 0
+        if self.urls_to_visit:
+            await self.urls_to_visit.close()
+        if self.conn:
+            await self.conn.close()
+        self.thread_pool.shutdown(wait=False)
+        logger.info("Shutdown complete.")
 
 # Example usage:
+# Ensure that this script is run as the main module.
 # if __name__ == "__main__":
-#     start_urls = ["https://example.com"]
-#     feeds = ["https://example.com/rss"]
-#     crawler = Crawler(start_urls=start_urls, feeds=feeds, name="example_crawler")
+#     start_urls = ["https://www.bbc.co.uk"]
+#     feeds = [
+#         "https://feeds.bbci.co.uk/news/rss.xml",
+#         "https://feeds.bbci.co.uk/news/uk/rss.xml",
+#         # Add more feeds as needed
+#     ]
+#     crawler = Crawler(
+#         start_urls=start_urls,
+#         feeds=feeds,
+#         name="BBC_news_mage_scrape",
+#         allowed_subdirs=["https://bbc.co.uk/news/", "https://feeds.bbci.co.uk/news"],
+#         exclude_subdirs=[
+#             "www.bbc.co.uk/news/world-",
+#             "www.bbc.co.uk/news/election-",
+#         ],
+#         exclude_scrape_subdirs=[
+#             "www.bbc.co.uk/news/resources/",
+#             "www.bbc.co.uk/news/topics/",
+#             "www.bbc.co.uk/news/world-",
+#             "www.bbc.co.uk/news/election-",
+#         ],
+#         find_new_site=True,
+#     )
 #     asyncio.run(crawler.crawl_start())

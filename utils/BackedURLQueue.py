@@ -1,9 +1,9 @@
+import asyncio
 from urllib.parse import urlparse, urlunparse, quote, unquote
 import aiosqlite
-import asyncio
 import datetime
 import logging
-from typing import Optional
+from typing import Any, Optional, List, Tuple, Dict
 
 # Initialize logging
 logging.basicConfig(
@@ -12,52 +12,54 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Define change frequency intervals
-changefreq_intervals = {
+CHANGEFREQ_INTERVALS = {
     "always": datetime.timedelta(minutes=5),
     "hourly": datetime.timedelta(hours=1),
     "daily": datetime.timedelta(days=1),
     "weekly": datetime.timedelta(weeks=1),
     "monthly": datetime.timedelta(days=30),
     "yearly": datetime.timedelta(days=365),
-    "never": None,  # Use None to indicate that the page should not be revisited
+    "never": None,  # Indicates that the page should not be revisited
 }
 
-
-from urllib.parse import urlparse, urlunparse, quote, unquote
-
 def normalize_url(url: str) -> str:
-    """Standardize and clean URL format by enforcing https://, removing www prefix, 
-    handling web.archive.org links, and ensuring consistent formatting of the path."""
-    # Check and handle web.archive.org URLs
-    if "web.archive.org" in url:
-        live_url_start = url.find("/https://")
-        if live_url_start != -1:
-            url = url[live_url_start + 1:]
+    """
+    Standardize and clean URL format by enforcing https://, removing www prefix,
+    handling web.archive.org links, and ensuring consistent formatting of the path.
+    """
+    try:
+        # Handle web.archive.org URLs
+        if "web.archive.org" in url:
+            live_url_start = url.find("/https://")
+            if live_url_start != -1:
+                url = url[live_url_start + 1:]
 
-    parsed = urlparse(url)
-    scheme = "https"
-    
-    # Normalize the hostname by removing "www" and ensuring lowercase
-    hostname = parsed.hostname.lower().replace("www.", "") if parsed.hostname else ""
-    
-    # Handle paths, preserving any file extensions dynamically
-    path = parsed.path
-    if not path or not path.split('/')[-1].count('.'):
-        path = quote(unquote(path.rstrip("/"))) + "/"
-    else:
-        path = quote(unquote(path))
+        parsed = urlparse(url)
+        scheme = "https"
 
-    # Manage port normalization based on scheme
-    port = (
-        None
-        if (scheme == "http" and parsed.port == 80) or (scheme == "https" and parsed.port == 443)
-        else parsed.port
-    )
-    netloc = f"{hostname}:{port}" if port else hostname
+        # Normalize hostname
+        hostname = parsed.hostname.lower().replace("www.", "") if parsed.hostname else ""
 
-    return urlunparse((scheme, netloc, path, "", parsed.query, ""))
+        # Normalize path
+        path = parsed.path
+        if not path or not any(part.count('.') for part in path.split('/')):
+            path = quote(unquote(path.rstrip("/"))) + "/"
+        else:
+            path = quote(unquote(path))
 
+        # Normalize port
+        port = (
+            None
+            if (scheme == "http" and parsed.port == 80) or (scheme == "https" and parsed.port == 443)
+            else parsed.port
+        )
+        netloc = f"{hostname}:{port}" if port else hostname
 
+        normalized = urlunparse((scheme, netloc, path, "", parsed.query, ""))
+        return normalized
+    except Exception as e:
+        logger.error(f"Error normalizing URL {url}: {e}")
+        return url  # Return original URL if normalization fails
 
 class URLItem:
     def __init__(
@@ -79,11 +81,7 @@ class URLItem:
         lastmod: Optional[str] = None,
         priority: Optional[float] = None,
         status: str = "unseen",  # Status can be 'unseen', 'processing', 'seen', 'revisiting'
-        db = None
     ):
-        
-        self.db = db
-        
         self.url = url
         self.url_score = url_score
         self.page_score = page_score
@@ -102,7 +100,7 @@ class URLItem:
         self.priority = priority
         self.status = status
 
-    def to_dict(self):
+    def to_dict(self) -> Dict[str, Any]:
         return {
             "url": self.url,
             "url_score": self.url_score,
@@ -124,110 +122,107 @@ class URLItem:
         }
 
     @staticmethod
-    def from_row(row):
+    def from_row(row: aiosqlite.Row) -> 'URLItem':
         return URLItem(
-            url=row[0],
-            url_score=row[1],
-            page_score=row[2],
-            page_type=row[3],
-            lastmod_sitemap=row[4],
-            changefreq_sitemap=row[5],
-            priority_sitemap=row[6],
-            time_last_visited=row[7],
-            next_revisit_time=row[8],  # Adjusted index for new field
-            revisit_count=row[9],
-            flair=row[10],
-            reddit_score=row[11],
-            error=row[12],
-            changefreq=row[13],
-            lastmod=row[14],
-            priority=row[15],
-            status=row[16],
+            url=row["url"],
+            url_score=row["url_score"],
+            page_score=row["page_score"],
+            page_type=row["page_type"],
+            lastmod_sitemap=row["lastmod_sitemap"],
+            changefreq_sitemap=row["changefreq_sitemap"],
+            priority_sitemap=row["priority_sitemap"],
+            time_last_visited=row["time_last_visited"],
+            next_revisit_time=row["next_revisit_time"],
+            revisit_count=row["revisit_count"],
+            flair=row["flair"],
+            reddit_score=row["reddit_score"],
+            error=row["error"],
+            changefreq=row["changefreq"],
+            lastmod=row["lastmod"],
+            priority=row["priority"],
+            status=row["status"],
         )
 
-
 class BackedURLQueue:
-    def __init__(self, conn, table_name="url_metadata"):
+    def __init__(self, conn: aiosqlite.Connection, table_name: str = "url_metadata"):
         self.conn = conn
         self.table_name = table_name
         self.processed_urls = 0
-        self.start_time = datetime.datetime.now()
         self.revisit_event = asyncio.Event()
 
-    async def _get_connection(self):
-        return self.conn
+    async def initialize(self) -> None:
+        """Initialize the database table and indexes."""
+        await self._setup_db()
 
-    async def initialize(self):
-        """Initialize the database table and reload any necessary data."""
-        await self._setup_db(self.conn)
-        await self.reload(self.conn)  # Pass the connection to reload
-
-    async def _setup_db(self, conn):
-        await conn.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {self.table_name} (
-                url TEXT PRIMARY KEY,
-                url_score REAL,
-                page_score REAL,
-                page_type TEXT,
-                lastmod_sitemap TEXT,
-                changefreq_sitemap TEXT,
-                priority_sitemap REAL,
-                time_last_visited TEXT,
-                revisit_count INTEGER DEFAULT 0,
-                flair TEXT,
-                reddit_score REAL,
-                error TEXT,
-                changefreq TEXT,
-                lastmod TEXT,
-                priority REAL,
-                status TEXT DEFAULT 'unseen',
-                next_revisit_time TEXT
-            );
-            """
-        )
-        # Add indexes for performance
-        await conn.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_status_url_score ON {self.table_name} (status, url_score DESC);"
-        )
-        await conn.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_next_revisit_time ON {self.table_name} (next_revisit_time);"
-        )
-        await conn.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_url ON {self.table_name} (url);"
-        )
-        
-        await conn.execute(
-            f"CREATE TABLE IF NOT EXISTS {self.table_name}_canonical_url (url TEXT PRIMARY KEY, canonical_url TEXT);"
-        )
-        await conn.commit()
-    
-    async def get(self,url):
-        url = normalize_url(url)
-        cursor = await self.conn.execute(
-            f"""
-            SELECT url, url_score, page_score, page_type, lastmod_sitemap, changefreq_sitemap,
-                   priority_sitemap, time_last_visited, next_revisit_time, revisit_count, flair, reddit_score, error,
-                   changefreq, lastmod, priority, status
-            FROM {self.table_name}
-            WHERE url = ?
-            """,
-            (url,),
-        )
-        row = await cursor.fetchone()
-        await cursor.close()
-        if row:
-            return URLItem.from_row(row)
-        return None
-    
-    async def push(self, url_item: URLItem):
+    async def _setup_db(self) -> None:
+        """Create the necessary tables and indexes."""
         try:
-            url_item.url = normalize_url(url_item.url)
+            await self.conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {self.table_name} (
+                    url TEXT PRIMARY KEY,
+                    url_score REAL,
+                    page_score REAL,
+                    page_type TEXT,
+                    lastmod_sitemap TEXT,
+                    changefreq_sitemap TEXT,
+                    priority_sitemap REAL,
+                    time_last_visited TEXT,
+                    next_revisit_time TEXT,
+                    revisit_count INTEGER DEFAULT 0,
+                    flair TEXT,
+                    reddit_score REAL,
+                    error TEXT,
+                    changefreq TEXT,
+                    lastmod TEXT,
+                    priority REAL,
+                    status TEXT DEFAULT 'unseen'
+                );
+                """
+            )
+            await self.conn.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_status_url_score ON {self.table_name} (status, url_score DESC);"
+            )
+            await self.conn.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_next_revisit_time ON {self.table_name} (next_revisit_time);"
+            )
+            await self.conn.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_url ON {self.table_name} (url);"
+            )
+            await self.conn.commit()
+            logger.info(f"Database table '{self.table_name}' initialized successfully.")
+        except aiosqlite.Error as e:
+            logger.error(f"Error setting up database table '{self.table_name}': {e}")
+
+    async def get(self, url: str) -> Optional[URLItem]:
+        """Retrieve a URLItem by URL."""
+        try:
+            normalized_url = normalize_url(url)
+            cursor = await self.conn.execute(
+                f"""
+                SELECT *
+                FROM {self.table_name}
+                WHERE url = ?
+                """,
+                (normalized_url,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            if row:
+                return URLItem.from_row(row)
+            return None
+        except aiosqlite.Error as e:
+            logger.error(f"Error fetching URL '{url}': {e}")
+            return None
+
+    async def push(self, url_item: URLItem) -> None:
+        """Insert or update a URLItem in the database."""
+        try:
             data = url_item.to_dict()
-            placeholders = ", ".join(["?"] * len(data))
             columns = ", ".join(data.keys())
+            placeholders = ", ".join(["?"] * len(data))
             values = tuple(data.values())
-    
+
             await self.conn.execute(
                 f"""
                 INSERT OR REPLACE INTO {self.table_name} ({columns})
@@ -236,24 +231,21 @@ class BackedURLQueue:
                 values,
             )
             await self.conn.commit()
+            logger.debug(f"Pushed URL to queue: {url_item.url}")
         except aiosqlite.Error as e:
-            logger.error(f"Failed to push or update URL {url_item.url}: {e}")
-
-
+            logger.error(f"Failed to push/update URL '{url_item.url}': {e}")
 
     async def pop(self) -> Optional[URLItem]:
-        """Retrieve and return the next URLItem to process."""
+        """Retrieve and mark the next unseen URLItem as processing."""
         try:
             cursor = await self.conn.execute(
                 f"""
-                    SELECT url, url_score, page_score, page_type, lastmod_sitemap, changefreq_sitemap,
-                           priority_sitemap, time_last_visited, next_revisit_time, revisit_count, flair, reddit_score, error,
-                           changefreq, lastmod, priority, status
-                    FROM {self.table_name}
-                    WHERE status = 'unseen'
-                    ORDER BY url_score DESC
-                    LIMIT 1
-                    """
+                SELECT *
+                FROM {self.table_name}
+                WHERE status = 'unseen'
+                ORDER BY url_score DESC
+                LIMIT 1
+                """
             )
             row = await cursor.fetchone()
             await cursor.close()
@@ -261,39 +253,36 @@ class BackedURLQueue:
             if row:
                 url_item = URLItem.from_row(row)
                 await self.conn.execute(
-                    f"UPDATE {self.table_name} SET status = 'processing' WHERE url = ?",
+                    f"""
+                    UPDATE {self.table_name}
+                    SET status = 'processing'
+                    WHERE url = ?
+                    """,
                     (url_item.url,),
                 )
                 await self.conn.commit()
-                url_item.status = "processing"
-            else:
-                url_item = None
-            return url_item
+                logger.debug(f"Popped URL for processing: {url_item.url}")
+                return url_item
+            return None
         except aiosqlite.Error as e:
             logger.error(f"SQLite error during pop: {e}")
             return None
 
-    async def url_known(self,url) -> int:
+    async def url_known(self, url: str) -> bool:
+        """Check if a URL is already known in the queue."""
         try:
-            totle = 0
-            url = normalize_url(url)
+            normalized_url = normalize_url(url)
             cursor = await self.conn.execute(
-                f"SELECT 1 FROM {self.table_name} WHERE url = ?", (url,)
+                f"SELECT 1 FROM {self.table_name} WHERE url = ? LIMIT 1",
+                (normalized_url,),
             )
             exists = await cursor.fetchone()
             await cursor.close()
-            totle = 1 if exists else 0
-            
-            cursor = await self.conn.execute(
-                f"SELECT 1 FROM {self.table_name} WHERE next_revisit_time = ?", (url,)
-            )
-            exists = await cursor.fetchone()
-            await cursor.close()
-            totle = 1 if exists else 0
-            return totle
-        except:
-            pass
-        
+            return bool(exists)
+        except aiosqlite.Error as e:
+            logger.error(f"Error checking if URL is known '{url}': {e}")
+            return False
+
     async def count_seen(self) -> int:
         """Return the number of URLs that have been seen."""
         try:
@@ -302,256 +291,123 @@ class BackedURLQueue:
             )
             result = await cursor.fetchone()
             await cursor.close()
-            
-            
             return result[0] if result else 0
         except aiosqlite.Error as e:
-            logger.error("Failed to count seen URLs: {e}")
+            logger.error(f"Failed to count seen URLs: {e}")
             return 0
 
-    async def set_page_score(self, url: str, score: float):
+    async def set_page_score(self, url: str, score: float) -> None:
         """Set the page score for a given URL."""
         try:
-            url = normalize_url(url)
+            normalized_url = normalize_url(url)
             await self.conn.execute(
                 f"""
-                    UPDATE {self.table_name}
-                    SET page_score = ?
-                    WHERE url = ?
-                    """,
-                (score, url),
+                UPDATE {self.table_name}
+                SET page_score = ?
+                WHERE url = ?
+                """,
+                (score, normalized_url),
             )
             await self.conn.commit()
+            logger.debug(f"Set page score for URL '{url}' to {score}")
         except aiosqlite.Error as e:
-            logger.error(f"Failed to set page score for {url}: {e}")
+            logger.error(f"Failed to set page score for '{url}': {e}")
 
-    async def mark_error(self, url: str, status: str):
+    async def mark_error(self, url: str, status: str) -> None:
         """Mark a URL as having an error."""
         try:
-            url = normalize_url(url)
+            normalized_url = normalize_url(url)
             await self.conn.execute(
                 f"""
-                    UPDATE {self.table_name}
-                    SET status = 'error', error = ?
-                    WHERE url = ?
-                    """,
-                (status, url),
+                UPDATE {self.table_name}
+                SET status = 'error', error = ?
+                WHERE url = ?
+                """,
+                (status, normalized_url),
             )
             await self.conn.commit()
+            logger.debug(f"Marked URL '{url}' as error with status '{status}'")
         except aiosqlite.Error as e:
-            logger.error(f"Failed to mark error for {url}: {e}")
+            logger.error(f"Failed to mark error for '{url}': {e}")
 
-    async def mark_seen(self, url: str):
-        """Mark a URL as seen and processed, and calculate the next revisit time."""
+    async def mark_seen(self, url: str) -> None:
+        """Mark a URL as seen and calculate the next revisit time."""
         try:
-            url = normalize_url(url)
+            normalized_url = normalize_url(url)
             time_now = datetime.datetime.utcnow()
             time_last_visited_str = time_now.strftime("%Y-%m-%d %H:%M:%S")
 
-            # Fetch the change frequency from the database
+            # Fetch change frequency
             cursor = await self.conn.execute(
                 f"SELECT changefreq_sitemap, changefreq FROM {self.table_name} WHERE url = ?",
-                (url,),
+                (normalized_url,),
             )
             row = await cursor.fetchone()
             await cursor.close()
-            if row:
-                changefreq_sitemap, changefreq = row
-            else:
-                changefreq_sitemap, changefreq = None, None
 
-            # Determine the revisit interval
+            changefreq_sitemap, changefreq = row if row else (None, None)
             changefreq_value = (changefreq_sitemap or changefreq or "daily").lower()
-            revisit_interval = changefreq_intervals.get(
-                changefreq_value, datetime.timedelta(days=1)
-            )
+            revisit_interval = CHANGEFREQ_INTERVALS.get(changefreq_value, datetime.timedelta(days=1))
 
             if revisit_interval:
                 next_revisit_time = time_now + revisit_interval
                 next_revisit_time_str = next_revisit_time.strftime("%Y-%m-%d %H:%M:%S")
             else:
-                next_revisit_time_str = None  # For 'never' changefreq
+                next_revisit_time_str = None  # For 'never'
 
             await self.conn.execute(
                 f"""
-                    UPDATE {self.table_name}
-                    SET status = 'seen', time_last_visited = ?, next_revisit_time = ?
-                    WHERE url = ?
-                    """,
-                (time_last_visited_str, next_revisit_time_str, url),
+                UPDATE {self.table_name}
+                SET status = 'seen',
+                    time_last_visited = ?,
+                    next_revisit_time = ?
+                WHERE url = ?
+                """,
+                (time_last_visited_str, next_revisit_time_str, normalized_url),
             )
             await self.conn.commit()
             self.processed_urls += 1
+            logger.debug(f"Marked URL '{url}' as seen.")
         except aiosqlite.Error as e:
-            logger.error(f"Failed to mark {url} as seen: {e}")
+            logger.error(f"Failed to mark '{url}' as seen: {e}")
 
-    # In BackedURLQueue class
-    async def update_error(self, url: str, error_message: str):
+    async def update_error(self, url: str, error_message: str) -> None:
         """Log an error message for a specific URL in the database."""
-        url = normalize_url(url)
-        await self.conn.execute(
-            f"""
-            UPDATE {self.table_name}
-            SET status = 'error', error = ?
-            WHERE url = ?
-            """,
-            (error_message, url),
-        )
-        await self.conn.commit()
+        await self.mark_error(url, error_message)
 
-    async def mark_processing(self, url: str):
-        """Mark a URL as currently being processed."""
-        try:
-            url = normalize_url(url)
-            await self.conn.execute(
-                f"UPDATE {self.table_name} SET status = 'processing' WHERE url = ?",
-                (url,),
-            )
-            await self.conn.commit()
-        except aiosqlite.Error as e:
-            logger.error(f"Failed to mark {url} as processing: {e}")
-
-    async def reload(self, conn=None):
-        """Reset the processing status of URLs that were being processed when the crawler stopped."""
-        try:
-            if conn is None:
-                await self.conn.execute(
-                    f"""
-                        UPDATE {self.table_name}
-                        SET status = 'unseen'
-                        WHERE status = 'processing'
-                        """
-                )
-                await self.conn.commit()
-            else:
-                await self.conn.execute(
-                    f"""
-                    UPDATE {self.table_name}
-                    SET status = 'unseen'
-                    WHERE status = 'processing'
-                    """
-                )
-                await self.conn.commit()
-        except aiosqlite.Error as e:
-            logger.error(f"Failed to reload URLs: {e}")
-
-    async def have_been_seen(self, url: str) -> bool:
-        """Check if a URL has already been seen."""
-        try:
-            url = normalize_url(url)
-            cursor = await self.conn.execute(
-                f"SELECT status FROM {self.table_name} WHERE url = ?",
-                (url,),
-            )
-            result = await cursor.fetchone()
-            await cursor.close()
-            if result:
-                return result[0] in ["processing", "seen", "revisiting"]
-            return False
-        except aiosqlite.Error as e:
-            logger.error(f"Failed to check if {url} has been seen: {e}")
-            return False
-    
-    async def count_processing(self) -> int:
-        """Return the number of URLs that are currently being processed."""
-        try:
-            cursor = await self.conn.execute(
-                f"SELECT COUNT(*) FROM {self.table_name} WHERE status = 'processing'"
-            )
-            result = await cursor.fetchone()
-            await cursor.close()
-            return result[0] if result else 0
-        except aiosqlite.Error as e:
-            logger.error("Failed to count processing URLs: {e}")
-            return 0
-
-    async def count_unseen(self) -> int:
-        """Return the number of URLs that have not been seen yet."""
-        try:
-            cursor = await self.conn.execute(
-                f"SELECT COUNT(*) FROM {self.table_name} WHERE status = 'unseen'"
-            )
-            result = await cursor.fetchone()
-            await cursor.close()
-            return result[0] if result else 0
-        except aiosqlite.Error as e:
-            logger.error("Failed to count unseen URLs: {e}")
-            return 0
-
-    async def update_status(self, url: str, status: str):
-        """Update the status of a URL in the database."""
-        try:
-            url = normalize_url(url)  # Ensure the URL is normalized before updating
-            await self.conn.execute(
-                f"""
-                    UPDATE {self.table_name}
-                    SET status = ?
-                    WHERE url = ?
-                    """,
-                (status, url),
-            )
-            await self.conn.commit()
-        except aiosqlite.Error as e:
-            logger.error(f"Failed to update status for {url} to '{status}': {e}")
-
-    async def count_all(self) -> int:
-        """Return the total number of URLs in the queue."""
-        try:
-            cursor = await self.conn.execute(f"SELECT COUNT(*) FROM {self.table_name}")
-            result = await cursor.fetchone()
-            await cursor.close()
-            return result[0] if result else 0
-        except aiosqlite.Error as e:
-            logger.error("Failed to count all URLs: {e}")
-            return 0
-
-    async def empty(self) -> bool:
-        """Check if the queue is empty."""
-        unseen_count = await self.count_unseen()
-        return unseen_count == 0
-
-    async def reset(self):
-        """Reset the status of all URLs to 'unseen'."""
-        try:
-            await self.conn.execute(f"UPDATE {self.table_name} SET status = 'unseen'")
-            await self.conn.commit()
-        except aiosqlite.Error as e:
-            logger.error(f"Failed to reset the queue: {e}")
-
-    async def mark_revisit(self, url: str):
+    async def mark_revisit(self, url: str) -> None:
         """Mark a URL as needing to be revisited."""
         try:
-            url = normalize_url(url)
+            normalized_url = normalize_url(url)
             await self.conn.execute(
                 f"""
-                    UPDATE {self.table_name}
-                    SET status = 'revisiting'
-                    WHERE url = ?
-                    """,
-                (url,),
+                UPDATE {self.table_name}
+                SET status = 'revisiting'
+                WHERE url = ?
+                """,
+                (normalized_url,),
             )
             await self.conn.commit()
             self.revisit_event.set()  # Signal that a URL is ready for revisiting
+            logger.debug(f"Marked URL '{url}' for revisit.")
         except aiosqlite.Error as e:
-            logger.error(f"Failed to mark {url} for revisit: {e}")
+            logger.error(f"Failed to mark '{url}' for revisit: {e}")
 
-    async def pop_revisit(self):
-        """Asynchronously yield URLItems that need to be revisited."""
+    async def pop_revisit(self) -> Optional[URLItem]:
+        """Yield URLItems that need to be revisited asynchronously."""
         while True:
             try:
                 now_str = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
                 cursor = await self.conn.execute(
                     f"""
-                        SELECT url, url_score, page_score, page_type, lastmod_sitemap, changefreq_sitemap,
-                               priority_sitemap, time_last_visited, next_revisit_time, revisit_count, flair, reddit_score, error,
-                               changefreq, lastmod, priority, status
-                        FROM {self.table_name}
-                        WHERE status = 'seen' AND
-                              next_revisit_time IS NOT NULL AND
-                              next_revisit_time <= ?
-                        ORDER BY page_score DESC
-                        LIMIT 1
-                        """,
+                    SELECT *
+                    FROM {self.table_name}
+                    WHERE status = 'seen' AND
+                          next_revisit_time IS NOT NULL AND
+                          next_revisit_time <= ?
+                    ORDER BY page_score DESC
+                    LIMIT 1
+                    """,
                     (now_str,),
                 )
                 row = await cursor.fetchone()
@@ -567,9 +423,100 @@ class BackedURLQueue:
                     url_item.status = "processing"
                     yield url_item
                 else:
-                    # No URLs ready for revisiting, wait until one is marked
                     self.revisit_event.clear()
                 await self.revisit_event.wait()
             except aiosqlite.Error as e:
                 logger.error(f"SQLite error during pop_revisit: {e}")
-                await asyncio.sleep(1)  # Wait before retrying to prevent tight loop
+                await asyncio.sleep(1)  # Prevent tight loop on error
+
+    async def have_been_seen(self, url: str) -> bool:
+        """Check if a URL has already been seen."""
+        return await self.url_known(url)
+
+    async def count_processing(self) -> int:
+        """Return the number of URLs currently being processed."""
+        try:
+            cursor = await self.conn.execute(
+                f"SELECT COUNT(*) FROM {self.table_name} WHERE status = 'processing'"
+            )
+            result = await cursor.fetchone()
+            await cursor.close()
+            return result[0] if result else 0
+        except aiosqlite.Error as e:
+            logger.error(f"Failed to count processing URLs: {e}")
+            return 0
+
+    async def count_unseen(self) -> int:
+        """Return the number of URLs that have not been seen yet."""
+        try:
+            cursor = await self.conn.execute(
+                f"SELECT COUNT(*) FROM {self.table_name} WHERE status = 'unseen'"
+            )
+            result = await cursor.fetchone()
+            await cursor.close()
+            return result[0] if result else 0
+        except aiosqlite.Error as e:
+            logger.error(f"Failed to count unseen URLs: {e}")
+            return 0
+
+    async def update_status(self, url: str, status: str) -> None:
+        """Update the status of a URL in the database."""
+        try:
+            normalized_url = normalize_url(url)
+            await self.conn.execute(
+                f"""
+                UPDATE {self.table_name}
+                SET status = ?
+                WHERE url = ?
+                """,
+                (status, normalized_url),
+            )
+            await self.conn.commit()
+            logger.debug(f"Updated status for URL '{url}' to '{status}'.")
+        except aiosqlite.Error as e:
+            logger.error(f"Failed to update status for '{url}' to '{status}': {e}")
+
+    async def count_all(self) -> int:
+        """Return the total number of URLs in the queue."""
+        try:
+            cursor = await self.conn.execute(f"SELECT COUNT(*) FROM {self.table_name}")
+            result = await cursor.fetchone()
+            await cursor.close()
+            return result[0] if result else 0
+        except aiosqlite.Error as e:
+            logger.error(f"Failed to count all URLs: {e}")
+            return 0
+
+    async def empty(self) -> bool:
+        """Check if the queue is empty."""
+        unseen_count = await self.count_unseen()
+        return unseen_count == 0
+
+    async def reset(self) -> None:
+        """Reset the status of all URLs to 'unseen'."""
+        try:
+            await self.conn.execute(f"UPDATE {self.table_name} SET status = 'unseen'")
+            await self.conn.commit()
+            logger.info("Reset all URLs to 'unseen'.")
+        except aiosqlite.Error as e:
+            logger.error(f"Failed to reset the queue: {e}")
+
+    async def reload(self) -> None:
+        """Reset the processing status of URLs that were being processed when the crawler stopped."""
+        try:
+            await self.conn.execute(
+                f"""
+                UPDATE {self.table_name}
+                SET status = 'unseen'
+                WHERE status = 'processing'
+                """
+            )
+            await self.conn.commit()
+            logger.info("Reloaded URLs by resetting 'processing' to 'unseen'.")
+        except aiosqlite.Error as e:
+            logger.error(f"Failed to reload URLs: {e}")
+
+    async def close(self) -> None:
+        """Close any resources if needed."""
+        self.revisit_event.set()  # Wake up any waiting coroutines
+        logger.info("Closed BackedURLQueue.")

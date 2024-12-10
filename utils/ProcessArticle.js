@@ -2,46 +2,60 @@ const { Readability } = require('@mozilla/readability');
 const { JSDOM } = require('jsdom');
 const createDOMPurify = require('dompurify');
 
-// Function to process the article
-function ProcessArticle(html, url) {
+/**
+ * Processes HTML content to extract and sanitize the main article.
+ *
+ * @param {string} html - The HTML content of the webpage.
+ * @param {string} url - The URL of the webpage.
+ * @returns {string} - The extracted article as a JSON string.
+ */
+function processArticle(html, url) {
     try {
-        // Create a JSDOM instance with the HTML content and the correct URL
-        const dom = new JSDOM(html, { url: url });
+        // Initialize JSDOM with the provided HTML and URL
+        const dom = new JSDOM(html, { url });
 
-        // Initialize DOMPurify using the JSDOM window
-        const window = dom.window;
-        const DOMPurify = createDOMPurify(window);
+        // Initialize DOMPurify with the JSDOM window
+        const DOMPurify = createDOMPurify(dom.window);
 
         // Use Readability to parse the document
-        const reader = new Readability(dom.window.document, { disableJSONLD: false });
-        let article = reader.parse();
+        const reader = new Readability(dom.window.document);
+        const article = reader.parse();
 
-        // Sanitize the content using DOMPurify for security
+        if (!article) {
+            throw new Error('Readability failed to parse the article.');
+        }
+
+        // Sanitize the extracted content
         article.content = DOMPurify.sanitize(article.content);
 
-        return JSON.stringify(article); // Return the parsed article object as a JSON string
+        return JSON.stringify(article);
     } catch (error) {
-        // Log the error for debugging purposes
-        console.error(`Error in ProcessArticle for URL: ${url} - ${error.message}`);
-        process.exit(1); // Indicate an error occurred
+        console.error(`Error processing article from URL: ${url} - ${error.message}`);
+        process.exit(1);
     }
 }
 
-// Read the URL from the command-line arguments
-const url = process.argv[2];
+// Entry point
+(async () => {
+    try {
+        const url = process.argv[2];
+        if (!url) {
+            throw new Error('No URL provided. Usage: node ProcessArticle.js <URL>');
+        }
 
-// Read the HTML content from stdin
-let html = '';
-process.stdin.setEncoding('utf8');
+        let html = '';
+        process.stdin.setEncoding('utf8');
 
-process.stdin.on('data', function(chunk) {
-    html += chunk;
-});
+        for await (const chunk of process.stdin) {
+            html += chunk;
+        }
 
-process.stdin.on('end', function() {
-    // Process the article after all data has been received
-    const result = ProcessArticle(html, url);
-    if (result) {
-        console.log(result);
+        const result = processArticle(html, url);
+        if (result) {
+            console.log(result);
+        }
+    } catch (error) {
+        console.error(`Unexpected error: ${error.message}`);
+        process.exit(1);
     }
-});
+})();

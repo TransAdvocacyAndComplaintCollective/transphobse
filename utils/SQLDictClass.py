@@ -1,3 +1,4 @@
+import asyncio
 import time
 from urllib.robotparser import RobotFileParser
 import aiosqlite
@@ -67,7 +68,12 @@ class SQLDictClass:
             robot.parse(row[7].splitlines())
 
             return robot
-
+    
+    async def count_unseen(self):
+        async with self.conn.execute(f'SELECT COUNT(*) FROM {self.table_name} WHERE last_checked is NULL') as cursor:
+            result = await cursor.fetchone()
+            return result[0]
+        
     async def remove(self, url):
         """Remove the entry for a given URL."""
         await self.conn.execute(f'DELETE FROM {self.table_name} WHERE url = ?', (url,))
