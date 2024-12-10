@@ -465,14 +465,14 @@ async def main():
                 # Write results to CSV
                 for result in all_results:
                     await file.write(','.join([
-                        f'"{result.get("link", "").replace("\"", "\"\"")}"',
-                        f'"{result.get("link_text", "").replace("\"", "\"\"")}"',
-                        f'"{result.get("keyword", "").replace("\"", "\"\"")}"',
-                        f'"{result.get("engine", "").replace("\"", "\"\"")}"',
-                        f'"{result.get("snippet", "").replace("\"", "\"\"")}"',
-                        f'"{result.get("date_published", "").replace("\"", "\"\"")}"',
-                        f'"{result.get("section", "").replace("\"", "\"\"")}"',
-                        f'"{result.get("summary", "").replace("\"", "\"\"")}"'
+                        f"\"{result.get('link', '').replace('\"', '\"\"')}\"",
+                        f"\"{result.get('link_text', '').replace('\"', '\"\"')}\"",
+                        f"\"{result.get('keyword', '').replace('\"', '\"\"')}\"",
+                        f"\"{result.get('engine', '').replace('\"', '\"\"')}\"",
+                        f"\"{result.get('snippet', '').replace('\"', '\"\"')}\"",
+                        f"\"{result.get('date_published', '').replace('\"', '\"\"')}\"",
+                        f"\"{result.get('section', '').replace('\"', '\"\"')}\"",
+                        f"\"{result.get('summary', '').replace('\"', '\"\"')}\""
                     ]) + '\n')
 
                 logging.info(f"Completed processing for keyword: {keyword}")
