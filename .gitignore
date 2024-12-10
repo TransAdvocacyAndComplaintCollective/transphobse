@@ -8,3 +8,5 @@ databases
 databases
 databases/*
 databases/BBC_news_mage_scrape.db
+<Connection(Thread-1, started 135895437018816)>
+http_cache.sqlite
