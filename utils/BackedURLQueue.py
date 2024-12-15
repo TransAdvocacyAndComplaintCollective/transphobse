@@ -1,9 +1,10 @@
 import asyncio
+import json
 from urllib.parse import urlparse, urlunparse, quote, unquote
 import aiosqlite
 import datetime
 import logging
-from typing import Any, Optional, List, Tuple, Dict
+from typing import Any, Optional, Dict
 
 # Initialize logging
 logging.basicConfig(
@@ -21,6 +22,49 @@ CHANGEFREQ_INTERVALS = {
     "yearly": datetime.timedelta(days=365),
     "never": None,  # Indicates that the page should not be revisited
 }
+def parse_no_vary_search_header(header_value: str) -> dict:
+    """
+    Parse the No-Vary-Search header value into a structured policy dict.
+    This is a simplified parser that identifies key-order, params, and except directives.
+    Example outputs:
+    {
+        "key-order": True,
+        "params": True or ["param1", "param2"] or False,
+        "except": ["param1", "param2"]
+    }
+    """
+    policy = {
+        "key-order": False,
+        "params": False,
+        "except": []
+    }
+
+    # Split by commas first
+    parts = [p.strip() for p in header_value.split(',')]
+    for part in parts:
+        if part.startswith("key-order"):
+            policy["key-order"] = True
+        elif part.startswith("params"):
+            # check if we have params=("param1" "param2") or just params
+            if "=(" in part:
+                # Extract parameters inside quotes
+                start = part.find('=("') + 3
+                end = part.rfind('")')
+                if start > 2 and end > start:
+                    param_str = part[start:end]
+                    policy["params"] = param_str.split('" "')
+            else:
+                # boolean params
+                policy["params"] = True
+        elif part.startswith("except"):
+            # except=("param1" "param2")
+            start = part.find('=("') + 3
+            end = part.rfind('")')
+            if start > 2 and end > start:
+                param_str = part[start:end]
+                policy["except"] = param_str.split('" "')
+
+    return policy
 
 def normalize_url(url: str) -> str:
     """
@@ -80,7 +124,9 @@ class URLItem:
         changefreq: Optional[str] = None,
         lastmod: Optional[str] = None,
         priority: Optional[float] = None,
-        status: str = "unseen",  # Status can be 'unseen', 'processing', 'seen', 'revisiting'
+        status: str = "unseen",
+        etag: Optional[str] = None,
+        last_modified: Optional[str] = None
     ):
         self.url = url
         self.url_score = url_score
@@ -99,6 +145,8 @@ class URLItem:
         self.lastmod = lastmod
         self.priority = priority
         self.status = status
+        self.etag = etag
+        self.last_modified = last_modified
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -119,6 +167,8 @@ class URLItem:
             "lastmod": self.lastmod,
             "priority": self.priority,
             "status": self.status,
+            "etag": self.etag,
+            "last_modified": self.last_modified
         }
 
     @staticmethod
@@ -141,10 +191,13 @@ class URLItem:
             lastmod=row["lastmod"],
             priority=row["priority"],
             status=row["status"],
+            etag=row["etag"],
+            last_modified=row["last_modified"]
         )
 
+
 class BackedURLQueue:
-    def __init__(self, conn: aiosqlite.Connection, table_name: str = "url_metadata"):
+    def __init__(self, conn: aiosqlite.Connection, table_name: str = "urls_to_visit"):
         self.conn = conn
         self.table_name = table_name
         self.processed_urls = 0
@@ -157,6 +210,18 @@ class BackedURLQueue:
     async def _setup_db(self) -> None:
         """Create the necessary tables and indexes."""
         try:
+            
+            # Create the no_vary_search_policies table
+            await self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS no_vary_search_policies (
+                    domain TEXT,
+                    path TEXT,
+                    policy TEXT,
+                    PRIMARY KEY (domain, path)
+                );
+                """
+            )
             await self.conn.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS {self.table_name} (
@@ -176,7 +241,9 @@ class BackedURLQueue:
                     changefreq TEXT,
                     lastmod TEXT,
                     priority REAL,
-                    status TEXT DEFAULT 'unseen'
+                    status TEXT DEFAULT 'unseen',
+                    etag TEXT,
+                    last_modified TEXT
                 );
                 """
             )
@@ -193,6 +260,7 @@ class BackedURLQueue:
             logger.info(f"Database table '{self.table_name}' initialized successfully.")
         except aiosqlite.Error as e:
             logger.error(f"Error setting up database table '{self.table_name}': {e}")
+
 
     async def get(self, url: str) -> Optional[URLItem]:
         """Retrieve a URLItem by URL."""
@@ -222,6 +290,7 @@ class BackedURLQueue:
             columns = ", ".join(data.keys())
             placeholders = ", ".join(["?"] * len(data))
             values = tuple(data.values())
+            print(values)
 
             await self.conn.execute(
                 f"""
@@ -374,6 +443,33 @@ class BackedURLQueue:
     async def update_error(self, url: str, error_message: str) -> None:
         """Log an error message for a specific URL in the database."""
         await self.mark_error(url, error_message)
+    
+    async def get_no_vary_search_policy(self, domain: str, path: str) -> Optional[dict]:
+        """
+        Retrieve the No-Vary-Search policy for a given domain and path.
+        Returns the policy as a dictionary, or None if no policy exists.
+        """
+        try:
+            cursor = await self.conn.execute(
+                """
+                SELECT policy
+                FROM no_vary_search_policies
+                WHERE domain = ? AND path = ?
+                """,
+                (domain, path),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+
+            if row:
+                policy_json = row[0]
+                return json.loads(policy_json)  # Convert JSON string back to a dictionary
+            else:
+                return None  # No policy found
+        except aiosqlite.Error as e:
+            logger.error(f"Failed to retrieve No-Vary-Search policy for {domain}{path}: {e}")
+            return None
+
 
     async def mark_revisit(self, url: str) -> None:
         """Mark a URL as needing to be revisited."""
@@ -501,6 +597,61 @@ class BackedURLQueue:
         except aiosqlite.Error as e:
             logger.error(f"Failed to reset the queue: {e}")
 
+    async def update_etag_and_last_modified(self, url: str, etag: Optional[str], last_modified: Optional[str]) -> None:
+        """Update the ETag and Last-Modified values for a given URL."""
+        try:
+            normalized_url = normalize_url(url)
+            await self.conn.execute(
+                f"""
+                UPDATE {self.table_name}
+                SET etag = ?, last_modified = ?
+                WHERE url = ?
+                """,
+                (etag, last_modified, normalized_url),
+            )
+            await self.conn.commit()
+            logger.debug(f"Updated ETag and Last-Modified for URL '{url}'")
+        except aiosqlite.Error as e:
+            logger.error(f"Failed to update ETag and Last-Modified for '{url}': {e}")
+
+
+    async def store_no_vary_search_policy(self, domain: str, path: str, policy: dict) -> None:
+        """
+        Store a No-Vary-Search policy for a given domain and path.
+        Policy is stored as a JSON string.
+        """
+        try:
+            policy_json = json.dumps(policy)
+            await self.conn.execute(
+                """
+                INSERT OR REPLACE INTO no_vary_search_policies (domain, path, policy)
+                VALUES (?, ?, ?)
+                """,
+                (domain, path, policy_json),
+            )
+            await self.conn.commit()
+            logger.debug(f"Stored No-Vary-Search policy for {domain}{path}")
+        except aiosqlite.Error as e:
+            logger.error(f"Failed to store No-Vary-Search policy for {domain}{path}: {e}")
+
+
+    async def apply_no_vary_search_policy(self, url: str, no_vary_search: str):
+        """
+        Parse the No-Vary-Search policy and store it in the DB for the given domain and path.
+        We'll store policies per (domain, path) basis.
+        """
+        # Parse the URL
+        parsed = urlparse(url)
+        domain = parsed.hostname.lower().replace("www.", "") if parsed.hostname else ""
+        # We'll use the path as-is for specificity. If you want a more general approach,
+        # consider truncating the path to a certain level.
+        path = parsed.path or ""
+
+        policy = parse_no_vary_search_header(no_vary_search)
+        await self.store_no_vary_search_policy(domain, path, policy)
+
+
+
     async def reload(self) -> None:
         """Reset the processing status of URLs that were being processed when the crawler stopped."""
         try:
@@ -520,3 +671,11 @@ class BackedURLQueue:
         """Close any resources if needed."""
         self.revisit_event.set()  # Wake up any waiting coroutines
         logger.info("Closed BackedURLQueue.")
+    async def clear(self) -> None:
+        """Clear the URL queue."""
+        try:
+            await self.conn.execute(f"DELETE FROM {self.table_name}")
+            await self.conn.commit()
+            logger.info("Cleared URL queue.")
+        except aiosqlite.Error as e:
+            logger.error(f"Failed to clear the URL queue: {e}")

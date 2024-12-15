@@ -25,18 +25,9 @@ async def main():
     os.makedirs(data_dir, exist_ok=True)
     
     # Define the start URLs and RSS feed URLs
-    start_urls = ["https://www.bbc.co.uk"]
+    start_urls = ["https://metro.co.uk/"]
     feeds = [
-        "https://feeds.bbci.co.uk/news/rss.xml",
-        "https://feeds.bbci.co.uk/news/uk/rss.xml",
-        "https://feeds.bbci.co.uk/news/business/rss.xml",
-        "https://feeds.bbci.co.uk/news/politics/rss.xml",
-        "https://feeds.bbci.co.uk/news/health/rss.xml",
-        "https://feeds.bbci.co.uk/news/education/rss.xml",
-        "https://feeds.bbci.co.uk/news/science_and_environment/rss.xml",
-        "https://feeds.bbci.co.uk/news/technology/rss.xml",
-        "https://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml",
-        "https://feeds.bbci.co.uk/news/england/rss.xml",
+
     ]
     
     # Optional parameters (set to None or desired values)
@@ -44,23 +35,17 @@ async def main():
     end_date = None    # e.g., "2023-12-31"
     
     # Define subdirectories to allow and exclude
-    allowed_subdirs_cruel = ["https://bbc.co.uk/news/", "https://feeds.bbci.co.uk/news"]
+    allowed_subdirs_cruel = ["https://metro.co.uk/"]
     exclude_subdirs_cruel = [
-        "www.bbc.co.uk/news/world-",
-        "www.bbc.co.uk/news/election-",
     ]
     exclude_scrape_subdirs = [
-        "www.bbc.co.uk/news/resources/",
-        "www.bbc.co.uk/news/topics/",
-        "www.bbc.co.uk/news/world-",
-        "www.bbc.co.uk/news/election-",
     ]
     
     # Initialize the Crawler with optimized parameters
     crawler = Crawler(
         start_urls=start_urls,
         feeds=feeds,
-        name="BBC_news_mage_scrape",
+        name="metro_news_mage_scrape",
         allowed_subdirs=allowed_subdirs_cruel,
         start_date=start_date,
         end_date=end_date,

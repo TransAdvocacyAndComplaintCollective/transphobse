@@ -1,14 +1,10 @@
 import asyncio
-import csv
 import random
-import ssl
 import logging
 from typing import List, Dict, Optional
 from urllib.parse import urlencode, urljoin
-
-import aiohttp
-import aiofiles
 from bs4 import BeautifulSoup
+import httpx
 
 # import utils.keywords as keywords  # Ensure this module exists and contains KEYWORDS
 
@@ -28,23 +24,23 @@ async def get_searx_domains() -> List[str]:
     domains = []
     url = "https://searx.space/data/instances.json"
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, ssl=False) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    for instance, details in data.get("instances", {}).items():
-                        if details.get("network_type") == "normal":
-                            domains.append(f"{instance}search")
-                    logging.debug(f"Fetched {len(domains)} Searx domains.")
-                else:
-                    logging.error(f"Failed to fetch Searx domains, Status Code: {response.status}")
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, timeout=30)
+            if response.status_code == 200:
+                data = response.json()
+                for instance, details in data.get("instances", {}).items():
+                    if details.get("network_type") == "normal":
+                        domains.append(f"{instance}search")
+                logging.debug(f"Fetched {len(domains)} Searx domains.")
+            else:
+                logging.error(f"Failed to fetch Searx domains, Status Code: {response.status_code}")
     except Exception as e:
         logging.error(f"Exception while fetching Searx domains: {e}")
     return domains
 
 async def fetch_page(
     url: str,
-    session: aiohttp.ClientSession,
+    client: httpx.AsyncClient,
     headers: Dict[str, str],
     search_params: Optional[Dict[str, str]] = None,
     mode: str = "get",
@@ -58,52 +54,45 @@ async def fetch_page(
         logging.debug(f"Search Params: {search_params}")
 
     try:
-        request_kwargs = {
-            "headers": headers,
-            "ssl": False,
-            "timeout": aiohttp.ClientTimeout(total=timeout)
-        }
-
         if mode == "get":
-            async with session.get(url, **request_kwargs) as response:
-                logging.info(f"GET {response.status} - {response.url}")
-                return await process_response(response, json_mode)
+            response = await client.get(url, headers=headers, timeout=timeout, params=search_params)
         elif mode == "post":
-            async with session.post(url, data=search_params, **request_kwargs) as response:
-                logging.info(f"POST {response.status} - {response.url}")
-                return await process_response(response, json_mode)
+            response = await client.post(url, headers=headers, timeout=timeout, data=search_params)
         else:
             logging.error(f"Unsupported HTTP method: {mode}")
-    except aiohttp.ClientError as e:
-        logging.error(f"Client error while fetching {url}: {e}")
-    except asyncio.TimeoutError:
+            return {"content": None, "status": "error", "url": url}
+
+        logging.info(f"{mode.upper()} {response.status_code} - {response.url}")
+        return await process_response(response, json_mode)
+
+    except httpx.RequestError as e:
+        logging.error(f"Request error while fetching {url}: {e}")
+    except httpx.TimeoutException:
         logging.error(f"Timeout while fetching {url}")
-    except ssl.SSLError as e:
-        logging.error(f"SSL error while fetching {url}: {e}")
     except Exception as e:
         logging.error(f"Unexpected error while fetching {url}: {e}")
 
     return {"content": None, "status": "error", "url": url}
 
-async def process_response(response: aiohttp.ClientResponse, json_mode: bool) -> Dict[str, Optional[str]]:
+async def process_response(response: httpx.Response, json_mode: bool) -> Dict[str, Optional[str]]:
     """
     Processes the HTTP response and extracts content based on the mode.
     """
-    if response.status in {200, 202}:
+    if response.status_code in {200, 202}:
         if json_mode:
             try:
-                json_content = await response.json()
-                return {"content": json_content, "status": response.status, "url": str(response.url)}
+                json_content = response.json()
+                return {"content": json_content, "status": response.status_code, "url": str(response.url)}
             except Exception as e:
                 logging.error(f"Error parsing JSON: {e}")
         try:
-            text_content = await response.text()
-            return {"content": text_content, "status": response.status, "url": str(response.url)}
+            text_content = response.text
+            return {"content": text_content, "status": response.status_code, "url": str(response.url)}
         except Exception as e:
             logging.error(f"Error reading text content: {e}")
     else:
-        logging.warning(f"Unexpected status code: {response.status}")
-    return {"content": None, "status": response.status, "url": str(response.url)}
+        logging.warning(f"Unexpected status code: {response.status_code}")
+    return {"content": None, "status": response.status_code, "url": str(response.url)}
 
 async def search_engine(
     keyword: str,
@@ -131,8 +120,7 @@ async def search_engine(
     formatted_keyword = keyword
     search_attempts = 0
 
-
-    async with aiohttp.ClientSession() as session:
+    async with httpx.AsyncClient(headers={"User-Agent": random.choice(USER_AGENTS)}) as client:
         while search_attempts < retries:
 
             # Prepare search parameters
@@ -142,24 +130,13 @@ async def search_engine(
             if page_param:
                 params[page_param] = str(current_index)
 
-            headers = {
-                "User-Agent": random.choice(USER_AGENTS),
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/png,image/svg+xml,*/*;q=0.8",
-                "Accept-Language": "en-GB,en;q=0.5",
-                "Upgrade-Insecure-Requests": "1",
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "same-origin"
-            }
-
             base_url = random.choice(base_urls)
-            url = f"{base_url}?{urlencode(params)}" if mode == "get" else base_url
+            url = base_url
 
             # Rate limiting
             await asyncio.sleep(rate_limit)
 
-            result = await fetch_page(url, session, headers, params, mode, json_mode=json_mode)
+            result = await fetch_page(url, client, headers={"User-Agent": random.choice(USER_AGENTS)}, search_params=params, mode=mode, json_mode=json_mode)
             content, status, final_url = result["content"], result["status"], result["url"]
 
             if status in {429, 403}:  # Rate limited or forbidden

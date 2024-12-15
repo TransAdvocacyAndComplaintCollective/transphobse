@@ -9,8 +9,6 @@ import aiohttp
 import aiosqlite
 import feedparser
 import multiprocessing
-import signal
-import traceback
 from aiohttp import ClientSession
 from aiofiles import open as aio_open
 from aiocsv import AsyncDictWriter
@@ -267,13 +265,17 @@ class Crawler:
                 score, _, _ = self.key_finder.relative_keywords_score(result.get("link_text", ""))
                 await self.add_to_queue(result.get("link"), "webpage", min(score, 1))
 
-    async def add_to_queue(self, url: str, url_type: str, priority: int = 0) -> None:
+    async def add_to_queue(
+        self, url: str, url_type: str, priority: int = 0, lastmod=None, priority_sitemap=None, changefreq_sitemap=None
+    ) -> None:
         """
-        Add a URL to the queue after normalization and validation.
+        Add a URL to the queue after normalization, policy application, and validation.
         """
         try:
-            normalized_url = normalize_url(url)
+            # Apply No-Vary-Search policy before normalization
+            url = await self.canonicalize_url_with_policy(url)
 
+            normalized_url = normalize_url(url)
             if not self.is_valid_url(normalized_url):
                 return
             if await self.urls_to_visit.have_been_seen(normalized_url):
@@ -292,6 +294,9 @@ class Crawler:
                 url=normalized_url,
                 url_score=priority,
                 page_type=url_type,
+                lastmod=lastmod,
+                priority=priority_sitemap,
+                changefreq_sitemap=changefreq_sitemap,
                 status="unseen",
             )
             await self.urls_to_visit.push(url_item)
@@ -301,11 +306,61 @@ class Crawler:
             self.estimated_total_pages = int(
                 self.total_discovered_links * self.average_links_per_page * self.filtering_factor
             )
-
-            # Update the estimated total pages
-            await self.update_estimated_total_pages(batch_number=len(self.discovery_rate))
         except Exception as e:
             logger.error(f"Failed to add URL to queue: {url} - Error: {e}")
+
+    async def canonicalize_url_with_policy(self, url: str) -> str:
+        """
+        Apply No-Vary-Search policy to the given URL if available.
+        This involves:
+        - If key-order: sorting query parameters by key.
+        - If params boolean: strip all query parameters if True
+        - If params is a list: remove all query parameters not in that list
+        - If except is a list: when params=True, remove all params except those listed
+        """
+        parsed = urlparse(url)
+        domain = parsed.hostname.lower().replace("www.", "") if parsed.hostname else ""
+        path = parsed.path or ""
+        policy = await self.urls_to_visit.get_no_vary_search_policy(domain, path)
+        if not policy:
+            # No policy found for exact path, try without path
+            # (Already implemented in get_no_vary_search_policy)
+            return url
+
+        query_params = []
+        for q in parsed.query.split("&"):
+            if q.strip():
+                query_params.append(q.split("=", 1))
+
+        # Apply params and except logic
+        if policy["params"] is True:
+            # Ignore all parameters unless they are in except
+            if policy["except"]:
+                # Keep only params in except
+                query_params = [param for param in query_params if param[0] in policy["except"]]
+            else:
+                # Remove all query params
+                query_params = []
+        elif isinstance(policy["params"], list):
+            # Keep only params listed in policy["params"]
+            query_params = [param for param in query_params if param[0] in policy["params"]]
+
+        # Apply key-order if set
+        if policy["key-order"]:
+            query_params.sort(key=lambda x: x[0])
+
+        # Rebuild query string
+        new_query = "&".join(f"{k}={v}" for k, v in query_params)
+
+        canonical_url = urlunparse((
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            parsed.params,
+            new_query,
+            parsed.fragment
+        ))
+        return canonical_url
 
     def is_valid_url(self, url: str) -> bool:
         """
@@ -313,37 +368,57 @@ class Crawler:
         """
         parsed = urlparse(url)
         return all([parsed.scheme, parsed.netloc])
+    
 
-    async def fetch_content(self, session: ClientSession, url_item: URLItem) -> Tuple[Optional[str], Optional[str]]:
-        """
-        Fetch the content of a URL.
-        """
+    async def fetch_content(self, session: ClientSession, url_item: URLItem) -> Tuple[Optional[str], Optional[str], Optional[str]]:
         url = url_item.url
         retries = 5
         backoff = 3
         ssl_context = ssl.create_default_context(cafile=ssl.get_default_verify_paths().cafile)
 
+        # Prepare headers
+        fetch_headers = HEADERS.copy()
+        if url_item.etag:
+            fetch_headers["If-None-Match"] = url_item.etag
+        if url_item.last_modified:
+            fetch_headers["If-Modified-Since"] = url_item.last_modified
+
         for attempt in range(retries):
             try:
-                async with session.get(url, ssl=ssl_context, timeout=30) as response:
+                async with session.get(url, ssl=ssl_context, timeout=30, headers=fetch_headers) as response:
+                    no_vary_search = response.headers.get("No-Vary-Search")
+                    if no_vary_search:
+                        # Store the policy for this domain and path
+                        await self.urls_to_visit.apply_no_vary_search_policy(url, no_vary_search)
+
                     if response.status == 200:
                         text = await response.text(encoding='utf-8', errors='replace')
+                        last_modified = response.headers.get("Last-Modified")
+                        etag = response.headers.get("ETag")
+                        await self.urls_to_visit.update_etag_and_last_modified(url, etag, last_modified)
                         if text.strip():
-                            return text, response.headers.get("Content-Type", "")
+                            return text, response.headers.get("Content-Type", ""), last_modified
+                    elif response.status == 304:
+                        logger.info(f"Not modified: {url}")
+                        return None, None, None
                     elif response.status in {429, 503}:
                         await asyncio.sleep(backoff)
                         backoff *= 2
                     else:
-                        return None, None
+                        return None, None, None
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 logger.warning(f"Error fetching {url}: {e}. Retrying in {backoff} seconds.")
                 await asyncio.sleep(backoff)
                 backoff *= 2
             except Exception as e:
                 logger.error(f"Unexpected error fetching {url}: {e}")
-                return None, None
+                return None, None, None
 
-        return None, None
+        return None, None, None
+
+
+
+
 
     async def process_article(self, html: str, url: str) -> Dict[str, Any]:
         """
@@ -441,8 +516,11 @@ class Crawler:
             # Handle canonical URL
             if canonical_url and url_item.url != canonical_url:
                 await self.add_to_queue(canonical_url, "webpage", priority=score)
-
+                await self.urls_to_visit.mark_seen(url_item.url)
+                return
             await self.urls_to_visit.mark_seen(url_item.url)
+
+            
             # Collect CSV row if score is positive
             if score > 0:
                 await self.urls_to_visit.set_page_score(url_item.url, score)
@@ -455,7 +533,12 @@ class Crawler:
         self, text: str, url_item: URLItem, article: Dict[str, Any]
     ) -> Optional[Tuple[float, List[str], List[Tuple[str, str, float]], Optional[str], Dict[str, Any]]]:
         """
-        Synchronous method to analyze webpage content.
+        Synchronous method to analyze webpage content. This method returns:
+        - score: The relative keyword score of the content.
+        - keywords: The found keywords in the content.
+        - links_to_queue: A list of (url, type, priority) tuples for links found on the page.
+        - canonical_url: The canonical URL for this page if any.
+        - metadata: Extracted metadata from the content.
         """
         try:
             bs = BeautifulSoup(text, "lxml")
@@ -467,7 +550,9 @@ class Crawler:
             # Extract and prepare links to queue
             links = {a["href"] for a in bs.find_all("a", href=True)}
             links_to_queue = [
-                (urljoin(url_item.url, link), "webpage", score) for link in links if self.is_valid_url(urljoin(url_item.url, link))
+                (urljoin(url_item.url, link), "webpage", score) 
+                for link in links 
+                if self.is_valid_url(urljoin(url_item.url, link))
             ]
 
             # Check for canonical URL
@@ -482,7 +567,7 @@ class Crawler:
         except Exception as e:
             logger.exception(f"Error in _analyze_webpage_content_sync: {e}")
             return None
-
+        
     def extract_metadata(self, bs: BeautifulSoup, url: str) -> Dict[str, Any]:
         """
         Extract metadata from the HTML content.
@@ -597,9 +682,19 @@ class Crawler:
         Process sitemap XML content.
         """
         bs = BeautifulSoup(text, "lxml")
-        urls = [loc.text for loc in bs.find_all("loc")]
-        add_tasks = [self.add_to_queue(link, "webpage") for link in urls]
+        urls = bs.find_all("url")
+
+        add_tasks = []
+        for url_tag in urls:
+            loc = url_tag.find("loc").text if url_tag.find("loc") else None
+            lastmod = url_tag.find("lastmod").text if url_tag.find("lastmod") else None
+            priority = float(url_tag.find("priority").text) if url_tag.find("priority") else None
+            changefreq = url_tag.find("changefreq").text if url_tag.find("changefreq") else None
+
+            if loc:
+                add_tasks.append(self.add_to_queue(loc, "webpage", priority=priority, lastmod=lastmod, changefreq_sitemap=changefreq))
         await asyncio.gather(*add_tasks, return_exceptions=True)
+
 
     def update_discovery_metrics(self, links_to_queue_count: int) -> None:
         """
@@ -683,7 +778,7 @@ class Crawler:
             return
 
         try:
-            text, mime = await self.fetch_content(session, url_item)
+            text, mime , last_modified= await self.fetch_content(session, url_item)
             if text:
                 await self.process_content(url_item, text, mime)
             else:
@@ -747,8 +842,6 @@ class Crawler:
             loop = asyncio.get_running_loop()
             stop_event = asyncio.Event()
 
-            for sig in (signal.SIGINT, signal.SIGTERM):
-                loop.add_signal_handler(sig, lambda: asyncio.create_task(stop_event.set()))
 
             crawl_task = asyncio.create_task(self.crawl_main())
             stop_event_task = asyncio.create_task(stop_event.wait())
@@ -758,50 +851,3 @@ class Crawler:
                 return_when=asyncio.FIRST_COMPLETED
             )
 
-            # Cancel the pending tasks if stop_event was triggered
-            for task in pending:
-                task.cancel()
-
-            if stop_event.is_set():
-                crawl_task.cancel()
-                await self.handle_shutdown()
-
-        logger.info("Crawling process completed.")
-        await self.handle_shutdown()
-
-    async def handle_shutdown(self):
-        """Handle shutdown procedures."""
-        if self.urls_to_visit:
-            await self.urls_to_visit.close()
-        if self.conn:
-            await self.conn.close()
-        self.thread_pool.shutdown(wait=False)
-        logger.info("Shutdown complete.")
-
-# Example usage:
-# Ensure that this script is run as the main module.
-# if __name__ == "__main__":
-#     start_urls = ["https://www.bbc.co.uk"]
-#     feeds = [
-#         "https://feeds.bbci.co.uk/news/rss.xml",
-#         "https://feeds.bbci.co.uk/news/uk/rss.xml",
-#         # Add more feeds as needed
-#     ]
-#     crawler = Crawler(
-#         start_urls=start_urls,
-#         feeds=feeds,
-#         name="BBC_news_mage_scrape",
-#         allowed_subdirs=["https://bbc.co.uk/news/", "https://feeds.bbci.co.uk/news"],
-#         exclude_subdirs=[
-#             "www.bbc.co.uk/news/world-",
-#             "www.bbc.co.uk/news/election-",
-#         ],
-#         exclude_scrape_subdirs=[
-#             "www.bbc.co.uk/news/resources/",
-#             "www.bbc.co.uk/news/topics/",
-#             "www.bbc.co.uk/news/world-",
-#             "www.bbc.co.uk/news/election-",
-#         ],
-#         find_new_site=True,
-#     )
-#     asyncio.run(crawler.crawl_start())

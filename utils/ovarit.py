@@ -1,4 +1,4 @@
-import aiohttp
+import httpx
 from bs4 import BeautifulSoup
 import asyncio
 import random
@@ -10,9 +10,7 @@ async def ovarit_domain_scrape(domain):
     seen_urls = set()   # To keep track of extracted URLs
     headers = {"User-Agent": "Mozilla/5.0"}
 
-    timeout = aiohttp.ClientTimeout(total=60)  # Adjust as needed
-
-    async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+    async with httpx.AsyncClient(headers=headers, timeout=httpx.Timeout(60)) as client:
         while base_url:
             if base_url in seen_pages:
                 print(f"Skipping already seen page: {base_url}")
@@ -21,13 +19,13 @@ async def ovarit_domain_scrape(domain):
             seen_pages.add(base_url)
 
             try:
-                async with session.get(base_url) as response:
-                    if response.status == 200:
-                        text = await response.text()
-                    else:
-                        print(f"Failed to retrieve {base_url} with status code {response.status}")
-                        break  # Stop processing if there's an HTTP error
-            except aiohttp.ClientError as e:
+                response = await client.get(base_url)
+                if response.status_code == 200:
+                    text = response.text
+                else:
+                    print(f"Failed to retrieve {base_url} with status code {response.status_code}")
+                    break  # Stop processing if there's an HTTP error
+            except httpx.RequestError as e:
                 print(f"Failed to retrieve {base_url}: {e}")
                 break  # Stop processing on network errors
 
