@@ -10,3 +10,19 @@ databases/*
 databases/BBC_news_mage_scrape.db
 <Connection(Thread-1, started 135895437018816)>
 http_cache.sqlite
+cpp/build/Crawler.d
+cpp/build/Crawler.o
+cpp/build/meage_scrape.d
+cpp/build/meage_scrape.o
+cpp/build/utils/FeedGenerator.d
+cpp/build/utils/FeedGenerator.o
+cpp/build/utils/HTTPFetcher.d
+cpp/build/utils/HTTPFetcher.o
+cpp/build/utils/log.d
+cpp/build/utils/log.o
+cpp/build/utils/SQLiteDB.d
+cpp/build/utils/SQLiteDB.o
+cpp/build/utils/URLItem.d
+cpp/build/utils/URLItem.o
+.gitignore
+package-lock.json
