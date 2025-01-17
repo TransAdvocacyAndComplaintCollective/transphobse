@@ -42,14 +42,25 @@ class KeypaceFinder:
         """Normalizes text by removing special characters, accents, and extra spaces."""
         if not text:
             return "", text
-        # Replace specific characters with spaces, remove accents, and clean punctuation
-        original_text = text
-        # text = re.sub(r"[-_\n]", " ", text)
-        text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("utf-8")
-        # text = re.sub(r"[^\w\s]", "", text)
-        # text = re.sub(r"\s+", " ", text).strip().lower()
-        return self.stem_phrase(text), text
     
+        # Decode bytes to str if necessary
+        if isinstance(text, bytes):
+            try:
+                text = text.decode('utf-8')  # Use appropriate encoding if not UTF-8
+            except UnicodeDecodeError as e:
+                logger.error("Failed to decode bytes: %s", e)
+                return "", text  # Return empty normalized text on failure
+    
+        # Replace specific characters with spaces, remove accents, and clean punctuation
+        original_text = text  # Keep a copy of the original text
+        text = unicodedata.normalize("NFKD", text)  # Normalization must happen on a string
+        text = ''.join(c for c in text if not unicodedata.combining(c))  # Remove accents
+        text = re.sub(r"[^\w\s]", "", text)  # Remove punctuation
+        text = re.sub(r"\s+", " ", text).strip().lower()  # Remove extra spaces and convert to lowercase
+        
+        return self.stem_phrase(text), original_text
+
+
     def stem_phrase(self, phrase):
         """Stems each word in a phrase using NLTK's SnowballStemmer."""
         words = phrase.split()

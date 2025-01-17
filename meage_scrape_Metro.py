@@ -45,7 +45,7 @@ async def main():
     crawler = Crawler(
         start_urls=start_urls,
         feeds=feeds,
-        name="metro_news_mage_scrape",
+        name="BBC_news_mage_scrape",
         allowed_subdirs=allowed_subdirs_cruel,
         start_date=start_date,
         end_date=end_date,

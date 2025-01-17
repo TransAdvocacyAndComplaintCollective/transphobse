@@ -38,6 +38,7 @@ async def main():
     allowed_subdirs_cruel = ["https://bbc.co.uk/news/","https://feeds.bbci.co.uk/news"]
     crawler = Crawler(
         start_urls,
+        
         feeds,
         "BBC_news_mage_scrape_cass",
         allowed_subdirs_cruel=allowed_subdirs_cruel,

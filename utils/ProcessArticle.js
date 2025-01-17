@@ -1,61 +1,94 @@
+/**
+ * ProcessArticlePersistent.js
+ */
+
 const { Readability } = require('@mozilla/readability');
-const { JSDOM } = require('jsdom');
+const { JSDOM, VirtualConsole } = require('jsdom');
 const createDOMPurify = require('dompurify');
+const readline = require('readline');
 
 /**
  * Processes HTML content to extract and sanitize the main article.
  *
  * @param {string} html - The HTML content of the webpage.
- * @param {string} url - The URL of the webpage.
- * @returns {string} - The extracted article as a JSON string.
+ * @param {string} url  - The URL of the webpage.
+ * @returns {object}    - The extracted article object, or an error object.
  */
 function processArticle(html, url) {
     try {
-        // Initialize JSDOM with the provided HTML and URL
-        const dom = new JSDOM(html, { url });
+        // Create a virtual console to suppress JSDOM warnings (e.g. CSS errors).
+        const virtualConsole = new VirtualConsole();
+        // If you want to see warnings, you can uncomment:
+        // virtualConsole.on("error", console.error);
 
-        // Initialize DOMPurify with the JSDOM window
+        // Initialize JSDOM with the virtual console
+        const dom = new JSDOM(html, { url, virtualConsole });
+
+        // Prepare DOMPurify
         const DOMPurify = createDOMPurify(dom.window);
 
-        // Use Readability to parse the document
+        // Use Mozilla's Readability
         const reader = new Readability(dom.window.document);
-        const article = reader.parse();
 
+        // We have removed the "isProbablyReaderable()" check.
+        // If you'd like to gate pages by “readability,” you can restore it,
+        // but confirm whether your Readability version offers it or not.
+
+        // Attempt to parse the article
+        const article = reader.parse();
         if (!article) {
             throw new Error('Readability failed to parse the article.');
         }
 
-        // Sanitize the extracted content
+        // Sanitize the Readability-parsed HTML content
         article.content = DOMPurify.sanitize(article.content);
 
-        return JSON.stringify(article);
+        // Return the final article object
+        return article;
     } catch (error) {
         console.error(`Error processing article from URL: ${url} - ${error.message}`);
-        process.exit(1);
+        return { error: `Processing failed: ${error.message}` };
     }
 }
 
-// Entry point
-(async () => {
+// Create an interface to read JSON requests from stdin, line by line
+const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    terminal: false,
+});
+
+// Listen for incoming lines (each line should be a JSON string)
+rl.on('line', (line) => {
     try {
-        const url = process.argv[2];
-        if (!url) {
-            throw new Error('No URL provided. Usage: node ProcessArticle.js <URL>');
+        // Parse the incoming request
+        const { html, url } = JSON.parse(line);
+        if (!html || !url) {
+            throw new Error('Invalid input: Missing HTML content or URL.');
         }
 
-        let html = '';
-        process.stdin.setEncoding('utf8');
-
-        for await (const chunk of process.stdin) {
-            html += chunk;
-        }
-
-        const result = processArticle(html, url);
-        if (result) {
-            console.log(result);
-        }
-    } catch (error) {
-        console.error(`Unexpected error: ${error.message}`);
-        process.exit(1);
+        // Process the article and output the JSON result
+        const article = processArticle(html, url);
+        console.log(JSON.stringify(article));
+    } catch (e) {
+        // Log error to stderr
+        console.error(`Failed to process line: ${e.message}`);
+        // Respond with a JSON error object
+        console.log(JSON.stringify({ error: e.message }));
     }
-})();
+});
+
+/**
+ * Catch any uncaught exceptions to prevent the process from crashing.
+ * Depending on your preferences, you might choose to exit the process.
+ */
+process.on('uncaughtException', (err) => {
+    console.error(`Uncaught exception: ${err.message}`);
+});
+
+/**
+ * Catch unhandled promise rejections.
+ */
+process.on('unhandledRejection', (reason) => {
+    console.error(`Unhandled rejection: ${reason}`);
+});
