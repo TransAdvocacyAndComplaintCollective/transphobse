@@ -1,32 +1,16 @@
 import logging
 import re
-import spacy
 import unicodedata
 import ahocorasick
-from nltk.stem import SnowballStemmer
-import nltk
-import utils.keywords as kw
+
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Download necessary NLTK data files (only required once)
-nltk.download('punkt')
-
 class KeypaceFinder:
-    def __init__(self, keywords:list[str]=kw.KEYWORDS):
-        # Initialize spaCy model and NLTK stemmer
-        try:
-            self.nlp = spacy.load("en_core_web_sm")
-        except OSError:
-            # Download model if not present
-            from spacy.cli import download
-            download("en_core_web_sm")
-            self.nlp = spacy.load("en_core_web_sm")
-
-        self.stemmer = SnowballStemmer("english")
-        self.keypace_automaton = self.build_automaton(keywords)
+    def __init__(self, keywords: list[str]):
         self.keywords = keywords
+        self.keypace_automaton = self.build_automaton(keywords)
 
     @staticmethod
     def build_automaton(keyphrases):
@@ -34,7 +18,7 @@ class KeypaceFinder:
         automaton = ahocorasick.Automaton()
         for idx, phrase in enumerate(keyphrases):
             automaton.add_word(phrase.lower(), (idx, phrase))
-        automaton.make_automaton()  # Finalize the automaton
+        automaton.make_automaton()
         logger.info("Aho-Corasick automaton built with %d keywords.", len(keyphrases))
         return automaton
 
@@ -42,77 +26,63 @@ class KeypaceFinder:
         """Normalizes text by removing special characters, accents, and extra spaces."""
         if not text:
             return "", text
-    
-        # Decode bytes to str if necessary
+
         if isinstance(text, bytes):
             try:
-                text = text.decode('utf-8')  # Use appropriate encoding if not UTF-8
+                text = text.decode('utf-8')
             except UnicodeDecodeError as e:
                 logger.error("Failed to decode bytes: %s", e)
-                return "", text  # Return empty normalized text on failure
-    
-        # Replace specific characters with spaces, remove accents, and clean punctuation
-        original_text = text  # Keep a copy of the original text
-        text = unicodedata.normalize("NFKD", text)  # Normalization must happen on a string
-        text = ''.join(c for c in text if not unicodedata.combining(c))  # Remove accents
-        text = re.sub(r"[^\w\s]", "", text)  # Remove punctuation
-        text = re.sub(r"\s+", " ", text).strip().lower()  # Remove extra spaces and convert to lowercase
-        
-        return self.stem_phrase(text), original_text
+                return "", text
 
+        original_text = text
+        text = unicodedata.normalize("NFKD", text)
+        text = ''.join(c for c in text if not unicodedata.combining(c))
+        text = re.sub(r"[^\w\s]", "", text)
+        text = re.sub(r"\s+", " ", text).strip().lower()
 
-    def stem_phrase(self, phrase):
-        """Stems each word in a phrase using NLTK's SnowballStemmer."""
-        words = phrase.split()
-        stemmed_phrase = " ".join([self.stemmer.stem(word) for word in words])
-        return stemmed_phrase
+        return text, original_text
 
     def find_keypaces(self, text):
-        """Finds key phrases in the text using the Aho-Corasick automaton."""
+        """Finds key phrases in the text using the Aho-Corasick automaton with word boundaries."""
         found_keypaces = []
         text_lower = text.lower()
         for end_index, (idx, phrase) in self.keypace_automaton.iter(text_lower):
             start_index = end_index - len(phrase) + 1
-            found_keypaces.append((phrase, start_index, end_index))
-        return found_keypaces
-
-    def find_keypaces2(self, text):
-        """Finds key phrases in the text using a simple list-based matching."""
-        found_keypaces = []
-        for phrase in self.keywords:
-            phrase_lower = phrase.lower()
-            start_index = text.lower().find(phrase_lower)
-            while start_index != -1:
-                end_index = start_index + len(phrase_lower) - 1
+            if ((start_index == 0 or not text_lower[start_index - 1].isalnum()) and
+                (end_index == len(text_lower) - 1 or not text_lower[end_index + 1].isalnum())):
                 found_keypaces.append((phrase, start_index, end_index))
-                # Search for the next occurrence of the phrase
-                start_index = text.lower().find(phrase_lower, start_index + 1)
         return found_keypaces
 
     def relative_keywords_score(self, text):
-        """Calculates the number of unique key phrases in the text and returns the score."""
+        """
+        Calculates the number of unique key phrases and total occurrences in the text.
+        Returns:
+            unique_count (int): Number of unique key phrases found.
+            unique_keypaces (List[str]): List of unique key phrases.
+            found_keypaces (List[Tuple[str, int, int]]): List of all occurrences with positions.
+            total_count (int): Total number of keyword occurrences found.
+        """
         normalized_text, original_text = self.normalize_text(text)
         logger.debug(f"Normalized Text: {normalized_text}")
         logger.debug(f"Original Text: {original_text}")
 
-        # Try normalized text first
+        # Use normalized text for matching
         found_keypaces = self.find_keypaces(normalized_text)
-        if found_keypaces:
-            found_keypaces_only = [phrase for phrase, _, _ in found_keypaces]
-            unique_keypaces = list(set(found_keypaces_only))  # Deduplicate
-            return len(unique_keypaces), unique_keypaces, found_keypaces
+        found_keypaces_only = [phrase for phrase, _, _ in found_keypaces]
+        unique_keypaces = list(set(found_keypaces_only))
+        unique_count = len(unique_keypaces)
+        total_count = len(found_keypaces)
 
-        # Fallback to raw matching using find_keypaces2
-        found_keypaces_raw = self.find_keypaces2(original_text)
-        found_keypaces_only_raw = [phrase for phrase, _, _ in found_keypaces_raw]
-        unique_keypaces_raw = list(set(found_keypaces_only_raw))  # Deduplicate
-        return len(unique_keypaces_raw), unique_keypaces_raw, found_keypaces_raw
+        return unique_count, unique_keypaces, found_keypaces, total_count
 
 # Example usage:
 if __name__ == "__main__":
     keywords = ["trans rights", "gender equality", "non-binary", "LGBTQ+", "transgender"]
     sample_text = "Your sample text goes here, mentioning Trans Rights and Gender Equality."
-    
+
     finder = KeypaceFinder(keywords)
-    score, keypaces, _ = finder.relative_keywords_score(sample_text)
-    print(f"Score: {score}, Keypaces: {keypaces}")
+    unique_count, unique_keypaces, occurrences, total_count = finder.relative_keywords_score(sample_text)
+    print(f"Unique Count: {unique_count}")
+    print(f"Unique Keypaces: {unique_keypaces}")
+    print(f"Total Occurrences: {total_count}")
+
